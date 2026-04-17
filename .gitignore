@@ -1,0 +1,45 @@
+# OS-specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python-related
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Deep Learning / Data
+# Ignore large model checkpoints but keep the directory structure
+outputs/checkpoints/*.pth
+outputs/logs/
+*.pt
+*.onnx
+
+# IDEs
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/
