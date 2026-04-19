@@ -32,6 +32,7 @@ MANIFEST
 
 # Deep Learning / Data
 # Ignore large model checkpoints but keep the directory structure
+outputs/
 outputs/checkpoints/*.pth
 outputs/logs/
 *.pt

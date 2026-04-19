@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.17)
 project(mcts_engine)
 
+set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_STANDARD 17)
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
@@ -83,5 +84,5 @@ target_include_directories(mcts_backend PRIVATE
 target_compile_features(mcts_backend PRIVATE cxx_std_17)
 
 if(NOT MSVC)
-  target_compile_definitions(mcts_backend PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+  target_compile_definitions(mcts_backend PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
 endif()

@@ -1,7 +1,6 @@
 import random
 import numpy as np
-from typing import Optional, Self, Callable, Protocol
-from collections.abc import Mapping, MutableMapping
+from typing import Optional, Self, Callable, Protocol, Mapping, MutableMapping
 from copy import deepcopy
 
 try:
@@ -66,8 +65,7 @@ class MCTS[S: State, A]:
 
         for _ in range(self.num_iters):
             cur_node = root
-            # Use native C++ clone() if available (e.g., OpenSpiel), otherwise fallback to deepcopy
-            cur_state = s_init.clone() if hasattr(s_init, "clone") else deepcopy(s_init)
+            cur_state = deepcopy(s_init)
 
             # Step 1: Selection
             while cur_node.is_expanded and (not cur_state.is_terminal()):
@@ -80,9 +78,6 @@ class MCTS[S: State, A]:
             if cur_state.is_terminal():
                 value = cur_state.rewards()
             else:
-                # evaluate_fn behaves differently based on your config:
-                # - Traditional: Returns (uniform_policy, random_rollout_result)
-                # - AlphaZero: Returns (neural_net_policy, neural_net_value)
                 policy, value = self.evaluate_fn(cur_state)
                 self.expand_node(cur_node, cur_state, policy)
 
@@ -105,8 +100,6 @@ class MCTS[S: State, A]:
         legal_actions: list[A] = state.legal_actions()
         for action in legal_actions:
             if action not in node.children:
-                # Initialize child node with prior probability P from policy
-                # Use .get() to avoid KeyError if policy doesn't cover all legal actions
                 prob = policy.get(action, 0.0)
                 node.children[action] = Node(parent=node, prior_prob=prob)
         node.is_expanded = True
@@ -124,21 +117,14 @@ class MCTS[S: State, A]:
         if not root.children:
             return {}
 
-        # Case 1: Competitive Play / Traditional MCTS (Greedy)
         if self.temperature <= 1e-3:
             max_visits = max(child.visit_count for child in root.children.values())
-            # Could be more than one if there's a tie
             best_actions = [a for a, c in root.children.items() if c.visit_count == max_visits]
             best_action = random.choice(best_actions)
             return {action: (1.0 if action == best_action else 0.0) for action in root.children}
 
-        # Case 2: AlphaZero Self-Play Training
         actions = list(root.children.keys())
         visits = np.array([child.visit_count for child in root.children.values()], dtype=np.float64)
-
-        # Stable calculation for high temperatures or large visit counts
-        # We use log-space if needed, but for Tau near 1, this is usually fine.
-        # However, Tau -> 0 is handled above. Tau > 0:
         weights = visits ** (1.0 / self.temperature)
         total_weight = np.sum(weights)
 
@@ -149,13 +135,12 @@ class MCTS[S: State, A]:
 
         return dict(zip(actions, probs))
 
-class CppMCTS:
-    def __init__(self, model_path: str, num_iters: int, temperature: float, num_threads: int = 4, batch_size: int = 8, c_puct: float = 1.0):
+
+class SelfPlayEngine:
+    def __init__(self, model_path: str, batch_size: int, num_threads: int, num_iters: int, temperature: float, c_puct: float = 1.0):
         if not USE_CPP:
             raise RuntimeError("C++ MCTS backend is not available.")
-        self.engine = mcts_backend.CppMCTS(model_path, num_iters, temperature, num_threads, batch_size, c_puct)
+        self.engine = mcts_backend.SelfPlayEngine(model_path, batch_size, num_threads, num_iters, temperature, c_puct)
             
-    def search(self, state):
-        game_string = state.get_game().to_string()
-        history = state.history()
-        return self.engine.search(game_string, history)
+    def generate_games(self, num_games: int, game_name: str = "connect_four"):
+        return self.engine.generate_games(num_games, game_name)

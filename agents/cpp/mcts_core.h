@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/script.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <vector>
 #include <map>
@@ -11,10 +12,31 @@
 #include <memory>
 #include <string>
 #include <atomic>
+#include <future>
+#include <chrono>
 
 #include "open_spiel/spiel.h"
 
 namespace py = pybind11;
+
+// Performance Monitoring Structure
+struct PerfMetrics {
+    std::atomic<long long> wait_time_us{0};      // Time spent waiting to fill a batch
+    std::atomic<long long> cat_time_us{0};       // Time spent in torch::cat and device move
+    std::atomic<long long> forward_time_us{0};   // Time spent in model.forward()
+    std::atomic<long long> parse_time_us{0};     // Time spent extracting data to results
+    std::atomic<long long> total_batches{0};     // Number of batches processed
+    std::atomic<long long> total_requests{0};    // Total inference requests handled
+    
+    std::atomic<long long> mcts_search_time_us{0};    // Time spent in MCTS logic (excluding eval wait)
+    std::atomic<long long> mcts_eval_wait_time_us{0}; // Time spent waiting for NN results
+    
+    void reset() {
+        wait_time_us = 0; cat_time_us = 0; forward_time_us = 0; parse_time_us = 0;
+        total_batches = 0; total_requests = 0;
+        mcts_search_time_us = 0; mcts_eval_wait_time_us = 0;
+    }
+};
 
 struct EvaluatorResult
 {
@@ -22,10 +44,15 @@ struct EvaluatorResult
     float value;
 };
 
+struct EvalRequest {
+    torch::Tensor state;
+    std::promise<EvaluatorResult> promise;
+};
+
 class BatchEvaluator
 {
 public:
-    BatchEvaluator(const std::string &model_path, int batch_size);
+    BatchEvaluator(const std::string &model_path, int batch_size, std::shared_ptr<PerfMetrics> metrics);
     ~BatchEvaluator();
 
     EvaluatorResult evaluate(const torch::Tensor &state);
@@ -34,16 +61,14 @@ public:
 private:
     torch::jit::script::Module model;
     int batch_size;
-    int next_id = 0;
     bool stop_flag = false;
 
     std::mutex m_mutex;
-    std::condition_variable cv;
     std::condition_variable cv_batch;
 
-    std::queue<std::pair<int, torch::Tensor>> queue;
-    std::map<int, EvaluatorResult> results;
+    std::queue<EvalRequest> queue;
     std::thread worker_thread;
+    std::shared_ptr<PerfMetrics> metrics;
 };
 
 struct Node
@@ -56,29 +81,35 @@ struct Node
     float total_value = 0.0f;
     float mean_value = 0.0f;
     float prior_prob = 1.0f;
-    std::mutex node_mutex; // Protect node properties from concurrent modification
-    std::atomic<int> virtual_loss{0}; // Virtual loss for multithreading
 
     Node(Node *p = nullptr, float prior = 1.0f) : parent(p), prior_prob(prior) {}
 };
 
-class CppMCTS
+struct StepRecord {
+    std::vector<float> obs;
+    std::vector<float> pi;
+    open_spiel::Player player;
+};
+
+class SelfPlayEngine
 {
 public:
-    CppMCTS(const std::string &model_path, int num_iters, float temperature, int num_threads, int batch_size, float c_puct);
-    ~CppMCTS();
+    SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct);
+    ~SelfPlayEngine();
 
-    py::dict search(const std::string& game_string, const std::vector<open_spiel::Action>& history);
+    py::list generate_games(int num_games, const std::string& game_name);
 
 private:
-    void mcts_worker(Node *root, std::shared_ptr<const open_spiel::Game> game, const std::vector<open_spiel::Action>& history, int iters);
+    void play_game(const std::string& game_name, std::vector<std::vector<std::tuple<std::vector<float>, std::vector<float>, float>>>& all_trajectories, std::mutex& traj_mutex);
+    void run_mcts(Node *root, const open_spiel::State& current_state);
     std::pair<open_spiel::Action, Node *> select_best_child(Node *node);
     void expand_node(Node *node, const open_spiel::State& state, const std::map<open_spiel::Action, float> &policy);
     void backpropagate(Node *node, float value);
 
     std::shared_ptr<BatchEvaluator> evaluator;
+    std::shared_ptr<PerfMetrics> metrics;
+    int num_threads;
     int num_iters;
     float temperature;
-    int num_threads;
     float c_puct;
 };

@@ -7,6 +7,27 @@ cd "$SCRIPT_DIR"
 
 echo "Building CppMCTS backend..."
 
+# Ensure submodules are initialized
+if [ ! -f "third_party/open_spiel/LICENSE" ]; then
+    echo "Initializing submodules..."
+    git submodule update --init --recursive
+fi
+
+# Ensure OpenSpiel internal dependencies (abseil, json, etc.) are present
+if [ ! -d "third_party/open_spiel/open_spiel/abseil-cpp" ]; then
+    echo "OpenSpiel dependencies missing. Running install script..."
+    # Disable optional heavy dependencies during the install script
+    export OPEN_SPIEL_BUILD_WITH_HANABI=OFF
+    export OPEN_SPIEL_BUILD_WITH_ACPC=OFF
+    export OPEN_SPIEL_BUILD_WITH_ORTOOLS=OFF
+    export OPEN_SPIEL_BUILD_WITH_LIBTORCH=OFF
+    export OPEN_SPIEL_BUILD_WITH_JULIA=OFF
+    
+    cd third_party/open_spiel
+    ./install.sh "$(which python3)"
+    cd ../..
+fi
+
 # Create build directory
 mkdir -p build
 cd build
@@ -26,7 +47,7 @@ cmake -DCMAKE_PREFIX_PATH="$SCRIPT_DIR/agents/cpp/libtorch" \
       ..
 
 # Compile the C++ extension
-make -j4
+make -j12
 
 # Move the compiled shared object (.so) file to the agents/ directory so Python can import it
 echo "Moving compiled extension to agents/..."

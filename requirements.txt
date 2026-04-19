@@ -5,3 +5,5 @@ pyyaml
 flet
 pybind11
 pytorch-lightning
+rich
+tensorboard
