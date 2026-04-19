@@ -41,14 +41,14 @@ class ConnectFourCNN(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(2 * 6 * 7, 7),
-            nn.Softmax(),
+            nn.Softmax(dim=1),
         )
         self.value_head = nn.Sequential(
             nn.Conv2d(128, 1, kernel_size=3, stride=1, padding="same", bias=False),
             nn.BatchNorm2d(1),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(2 * 6 * 7, 64),
+            nn.Linear(1 * 6 * 7, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
             nn.Tanh(),

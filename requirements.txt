@@ -4,3 +4,4 @@ torch
 pyyaml
 flet
 pybind11
+pytorch-lightning
