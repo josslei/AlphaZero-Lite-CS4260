@@ -43,3 +43,7 @@ outputs/logs/
 
 # Streamlit
 .streamlit/
+
+# Libtorch and CPP backend
+agents/cpp/libtorch/
+build/

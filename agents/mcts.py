@@ -4,6 +4,13 @@ from typing import Optional, Self, Callable, Protocol
 from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
 
+try:
+    from . import mcts_backend
+    USE_CPP = True
+except ImportError:
+    print("Warning: C++ MCTS backend not found. Falling back to slow Python version.")
+    USE_CPP = False
+
 
 type PPD[A] = Mapping[A, float]  # Policy Probability Distribution
 
@@ -13,6 +20,7 @@ class State[A](Protocol):
     def is_terminal(self) -> bool: ...
     def rewards(self) -> float: ...
     def apply_action(self, action: A) -> None: ...
+    def clone(self) -> Self: ...
 
 
 class Node[A]:
@@ -58,7 +66,8 @@ class MCTS[S: State, A]:
 
         for _ in range(self.num_iters):
             cur_node = root
-            cur_state = deepcopy(s_init)
+            # Use native C++ clone() if available (e.g., OpenSpiel), otherwise fallback to deepcopy
+            cur_state = s_init.clone() if hasattr(s_init, "clone") else deepcopy(s_init)
 
             # Step 1: Selection
             while cur_node.is_expanded and (not cur_state.is_terminal()):
@@ -139,3 +148,12 @@ class MCTS[S: State, A]:
             probs = weights / total_weight
 
         return dict(zip(actions, probs))
+
+class CppMCTS:
+    def __init__(self, model_path: str, num_iters: int, temperature: float, num_threads: int = 4, batch_size: int = 8, c_puct: float = 1.0):
+        if not USE_CPP:
+            raise RuntimeError("C++ MCTS backend is not available.")
+        self.engine = mcts_backend.CppMCTS(model_path, num_iters, temperature, num_threads, batch_size, c_puct)
+            
+    def search(self, state):
+        return self.engine.search(state)
