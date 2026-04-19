@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include "mcts_core.h"
 
 namespace py = pybind11;
@@ -12,5 +13,6 @@ PYBIND11_MODULE(mcts_backend, m) {
              py::arg("num_threads") = 4, 
              py::arg("batch_size") = 8, 
              py::arg("c_puct") = 1.0f)
-        .def("search", &CppMCTS::search, "Run multi-threaded MCTS search on the given state");
+        .def("search", &CppMCTS::search, "Run multi-threaded MCTS search on the given state",
+             py::arg("game_string"), py::arg("history"));
 }

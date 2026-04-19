@@ -18,10 +18,15 @@ PYBIND11_CMAKE_DIR=$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir()
 # Assumes libtorch is located at agents/cpp/libtorch relative to the project root
 cmake -DCMAKE_PREFIX_PATH="$SCRIPT_DIR/agents/cpp/libtorch" \
       -Dpybind11_DIR="$PYBIND11_CMAKE_DIR" \
+      -DPython_EXECUTABLE="$(which python3)" \
+      -DBUILD_SHARED_LIB=OFF \
+      -DOPEN_SPIEL_BUILD_WITH_PYTHON=OFF \
+      -DOPEN_SPIEL_BUILD_WITH_TESTS=OFF \
+      -DBUILD_TESTING=OFF \
       ..
 
 # Compile the C++ extension
-make -j
+make -j4
 
 # Move the compiled shared object (.so) file to the agents/ directory so Python can import it
 echo "Moving compiled extension to agents/..."

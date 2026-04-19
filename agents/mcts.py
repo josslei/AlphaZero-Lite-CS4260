@@ -8,7 +8,7 @@ try:
     from . import mcts_backend
     USE_CPP = True
 except ImportError:
-    print("Warning: C++ MCTS backend not found. Falling back to slow Python version.")
+    print("Warning: C++ MCTS backend not found.")
     USE_CPP = False
 
 
@@ -156,4 +156,6 @@ class CppMCTS:
         self.engine = mcts_backend.CppMCTS(model_path, num_iters, temperature, num_threads, batch_size, c_puct)
             
     def search(self, state):
-        return self.engine.search(state)
+        game_string = state.get_game().to_string()
+        history = state.history()
+        return self.engine.search(game_string, history)

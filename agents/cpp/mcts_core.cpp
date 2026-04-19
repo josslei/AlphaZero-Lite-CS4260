@@ -2,6 +2,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <chrono>
 
 // ---------- BatchEvaluator ----------
 BatchEvaluator::BatchEvaluator(const std::string &model_path, int batch_size)
@@ -59,12 +60,14 @@ void BatchEvaluator::run_inference()
     while (true)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
-        // Wait until a batch is gathered, or an exit signal is received
-        cv_batch.wait(lock, [this]
-                      { return queue.size() >= batch_size || stop_flag; });
+        cv_batch.wait_for(lock, std::chrono::milliseconds(2), [this]
+                          { return queue.size() >= batch_size || stop_flag; });
 
         if (stop_flag && queue.empty())
             break;
+
+        if (queue.empty())
+            continue;
 
         int current_batch_size = std::min((int)queue.size(), batch_size);
         std::vector<torch::Tensor> batch_tensors;
@@ -82,29 +85,37 @@ void BatchEvaluator::run_inference()
         if (batch_tensors.empty())
             continue;
 
-        auto input = torch::stack(batch_tensors);
+        auto input = torch::cat(batch_tensors, 0); // Use cat instead of stack because each tensor is already [1, C, H, W]
         std::vector<torch::jit::IValue> inputs;
         inputs.push_back(input);
 
-        // Assuming your model returns (policy_logits, value)
-        auto output = model.forward(inputs).toTuple();
-        torch::Tensor policy_tensor = torch::softmax(output->elements()[0].toTensor(), -1);
-        torch::Tensor value_tensor = output->elements()[1].toTensor();
+        try {
+            auto output = model.forward(inputs).toTuple();
+            torch::Tensor policy_tensor = output->elements()[0].toTensor();
+            torch::Tensor value_tensor = output->elements()[1].toTensor();
 
-        lock.lock();
-        for (int i = 0; i < current_batch_size; ++i)
-        {
-            EvaluatorResult res;
-            res.value = value_tensor[i].item<float>();
-
-            auto p = policy_tensor[i];
-            for (int a = 0; a < p.size(0); ++a)
+            lock.lock();
+            for (int i = 0; i < current_batch_size; ++i)
             {
-                res.policy[a] = p[a].item<float>();
+                EvaluatorResult res;
+                res.value = value_tensor[i].item<float>();
+
+                auto p = policy_tensor[i];
+                for (int a = 0; a < p.size(0); ++a)
+                {
+                    res.policy[a] = p[a].item<float>();
+                }
+                results[batch_ids[i]] = res;
             }
-            results[batch_ids[i]] = res;
+            cv.notify_all(); // Wake up all waiting worker threads
+        } catch (const c10::Error& e) {
+            std::cerr << "LibTorch Error in run_inference: " << e.what() << std::endl;
+            // Free waiting threads
+            lock.lock();
+            stop_flag = true;
+            cv.notify_all();
+            break;
         }
-        cv.notify_all(); // Wake up all waiting worker threads
     }
 }
 
@@ -117,39 +128,46 @@ CppMCTS::CppMCTS(const std::string &model_path, int num_iters, float temperature
 
 CppMCTS::~CppMCTS() {}
 
-void CppMCTS::expand_node(Node *node, py::object state, const std::map<int, float> &policy)
+void CppMCTS::expand_node(Node *node, const open_spiel::State& state, const std::map<open_spiel::Action, float> &policy)
 {
-    std::lock_guard<std::mutex> lock(node->node_mutex);
     if (node->is_expanded)
         return;
 
-    // Get legal actions from Python. Acquire GIL!
-    py::gil_scoped_acquire acquire;
-    py::list legal_actions = state.attr("legal_actions")();
-    for (auto item : legal_actions)
+    std::vector<open_spiel::Action> legal_actions = state.LegalActions();
+
+    std::lock_guard<std::mutex> lock(node->node_mutex);
+    
+    // Double-check
+    if (node->is_expanded)
+        return; 
+
+    for (open_spiel::Action action : legal_actions)
     {
-        int action = item.cast<int>();
         float prob = policy.count(action) ? policy.at(action) : 0.0f;
         node->children[action] = std::make_unique<Node>(node, prob);
     }
     node->is_expanded = true;
 }
 
-std::pair<int, Node *> CppMCTS::select_best_child(Node *node)
+std::pair<open_spiel::Action, Node *> CppMCTS::select_best_child(Node *node)
 {
     std::lock_guard<std::mutex> lock(node->node_mutex);
-    int best_action = -1;
+    open_spiel::Action best_action = -1;
     Node *best_child = nullptr;
     float best_score = -1e9;
 
-    float sqrt_parent_visits = std::sqrt((float)node->visit_count);
+    float parent_visits = node->visit_count + node->virtual_loss.load();
+    float sqrt_parent_visits = std::sqrt(std::max(1.0f, parent_visits));
 
     for (auto &pair : node->children)
     {
-        int action = pair.first;
+        open_spiel::Action action = pair.first;
         Node *child = pair.second.get();
-        float q_value = child->visit_count > 0 ? child->mean_value : 0.0f;
-        float u_value = c_puct * child->prior_prob * sqrt_parent_visits / (1.0f + child->visit_count);
+        
+        float child_visits = child->visit_count + child->virtual_loss.load();
+        
+        float q_value = child_visits > 0 ? (child->total_value - child->virtual_loss.load()) / child_visits : 0.0f;
+        float u_value = c_puct * child->prior_prob * sqrt_parent_visits / (1.0f + child_visits);
         float score = q_value + u_value;
 
         if (score > best_score)
@@ -159,6 +177,11 @@ std::pair<int, Node *> CppMCTS::select_best_child(Node *node)
             best_child = child;
         }
     }
+    
+    if (best_child != nullptr) {
+        best_child->virtual_loss++;
+    }
+
     return {best_action, best_child};
 }
 
@@ -171,103 +194,90 @@ void CppMCTS::backpropagate(Node *node, float value)
         cur->visit_count++;
         cur->total_value += value;
         cur->mean_value = cur->total_value / cur->visit_count;
+        
+        if (cur->virtual_loss.load() > 0) {
+            cur->virtual_loss--;
+        }
+        
         cur = cur->parent;
         value = -value; // Switch perspective
     }
 }
 
-void CppMCTS::mcts_worker(Node *root, py::object s_init, int iters)
+void CppMCTS::mcts_worker(Node *root, std::shared_ptr<const open_spiel::Game> game, const std::vector<open_spiel::Action>& history, int iters)
 {
     for (int i = 0; i < iters; ++i)
     {
         Node *cur_node = root;
 
-        // C++ calling Python's clone requires GIL.
-        // (Warning: If the Python side is slow, multiple threads will queue up here competing for the GIL)
-        py::gil_scoped_acquire acquire;
-        py::object cur_state;
-        if (py::hasattr(s_init, "clone"))
-        {
-            cur_state = s_init.attr("clone")();
+        std::unique_ptr<open_spiel::State> cur_state = game->NewInitialState();
+        for (open_spiel::Action action : history) {
+            cur_state->ApplyAction(action);
         }
-        else
-        {
-            // Fallback to deep copy
-            py::object copy_module = py::module::import("copy");
-            cur_state = copy_module.attr("deepcopy")(s_init);
-        }
-        py::gil_scoped_release release;
+
+        open_spiel::Player last_player = open_spiel::kInvalidPlayer;
 
         // Selection
         while (cur_node->is_expanded)
         {
-            bool is_terminal;
-            {
-                py::gil_scoped_acquire acquire_term;
-                is_terminal = cur_state.attr("is_terminal")().cast<bool>();
-            }
-            if (is_terminal)
+            if (cur_state->IsTerminal())
                 break;
 
+            last_player = cur_state->CurrentPlayer();
+
             auto best = select_best_child(cur_node);
-            int action = best.first;
+            open_spiel::Action action = best.first;
             Node *next_node = best.second;
 
-            {
-                py::gil_scoped_acquire acquire_apply;
-                cur_state.attr("apply_action")(action);
-            }
+            cur_state->ApplyAction(action);
             cur_node = next_node;
         }
 
         // Evaluation & Expansion
         float value = 0.0f;
-        bool is_terminal;
+        if (cur_state->IsTerminal())
         {
-            py::gil_scoped_acquire acquire_eval;
-            is_terminal = cur_state.attr("is_terminal")().cast<bool>();
-        }
-
-        if (is_terminal)
-        {
-            py::gil_scoped_acquire acquire_eval;
-            value = cur_state.attr("rewards")().cast<float>();
+            if (last_player != open_spiel::kInvalidPlayer) {
+                // In 2-player zero-sum games, the perspective of the next player is the negative of the last player
+                int next_player = 1 - last_player; 
+                value = cur_state->PlayerReturn(next_player);
+            }
         }
         else
         {
-            // Important: You need to provide a method (e.g., observation_tensor()) in the Python state object
-            // to convert the game grid into a flattened 1D std::vector recognizable by the C++ side, or directly return a Tensor-compatible format.
-            // Here we create a dummy all-zero Tensor as an example input
-            torch::Tensor obs = torch::zeros({1, 3, 6, 7}); // Dummy Shape
+            std::vector<float> obs_vec = cur_state->ObservationTensor();
+            torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, 3, 6, 7}, torch::kFloat).clone();
 
             EvaluatorResult res = evaluator->evaluate(obs);
-            expand_node(cur_node, cur_state, res.policy);
+            expand_node(cur_node, *cur_state, res.policy);
             value = res.value;
         }
 
-        // Backpropagation
         backpropagate(cur_node, value);
     }
 }
 
-py::dict CppMCTS::search(py::object s_init)
+py::dict CppMCTS::search(const std::string& game_string, const std::vector<open_spiel::Action>& history)
 {
+    std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame(game_string);
+    std::unique_ptr<open_spiel::State> root_state = game->NewInitialState();
+    for (open_spiel::Action action : history) {
+        root_state->ApplyAction(action);
+    }
+
     Node root(nullptr, 1.0f);
 
-    // Initial evaluation for root
-    py::gil_scoped_acquire acquire;
-    torch::Tensor obs = torch::zeros({1, 3, 6, 7}); // Dummy
-    py::gil_scoped_release release;
+    std::vector<float> obs_vec = root_state->ObservationTensor();
+    torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, 3, 6, 7}, torch::kFloat).clone();
 
     EvaluatorResult res = evaluator->evaluate(obs);
-    expand_node(&root, s_init, res.policy);
+    expand_node(&root, *root_state, res.policy);
 
-    // Start multiple worker threads for parallel tree search
     int iters_per_thread = num_iters / num_threads;
     std::vector<std::thread> threads;
     for (int i = 0; i < num_threads; ++i)
     {
-        threads.emplace_back(&CppMCTS::mcts_worker, this, &root, s_init, iters_per_thread);
+        threads.emplace_back(&CppMCTS::mcts_worker, this, &root, game, history, iters_per_thread);
     }
 
     for (auto &t : threads)
@@ -276,12 +286,11 @@ py::dict CppMCTS::search(py::object s_init)
             t.join();
     }
 
-    // Policy generation
     py::dict probs;
     if (temperature <= 1e-3f)
     {
         int max_visits = -1;
-        int best_action = -1;
+        open_spiel::Action best_action = -1;
         for (auto &pair : root.children)
         {
             if (pair.second->visit_count > max_visits)
@@ -298,7 +307,7 @@ py::dict CppMCTS::search(py::object s_init)
     else
     {
         float sum = 0.0f;
-        std::map<int, float> weights;
+        std::map<open_spiel::Action, float> weights;
         for (auto &pair : root.children)
         {
             float w = std::pow(pair.second->visit_count, 1.0f / temperature);
