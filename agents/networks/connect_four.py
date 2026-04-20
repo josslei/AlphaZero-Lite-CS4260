@@ -24,7 +24,7 @@ class ResidualBlockCNN(nn.Module):
 
 
 class ConnectFourCNN(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, return_logits: bool = False, **kwargs) -> None:
         super().__init__()
 
         self.in_conv = nn.Sequential(
@@ -35,14 +35,18 @@ class ConnectFourCNN(nn.Module):
         self.res1 = ResidualBlockCNN(128)
         self.res2 = ResidualBlockCNN(128)
         self.res3 = ResidualBlockCNN(128)
-        self.policy_head = nn.Sequential(
+
+        policy_layers = [
             nn.Conv2d(128, 2, kernel_size=3, stride=1, padding="same", bias=False),
             nn.BatchNorm2d(2),
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(2 * 6 * 7, 7),
-            nn.Softmax(dim=1),
-        )
+        ]
+        if not return_logits:
+            policy_layers.append(nn.Softmax(dim=1))
+        self.policy_head = nn.Sequential(*policy_layers)
+
         self.value_head = nn.Sequential(
             nn.Conv2d(128, 1, kernel_size=3, stride=1, padding="same", bias=False),
             nn.BatchNorm2d(1),

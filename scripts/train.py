@@ -6,7 +6,7 @@ import numpy as np
 import yaml
 import argparse
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 # Add the project root to sys.path so we can import from agents and core
@@ -84,6 +84,60 @@ def resolve_num_iters(config, current_epoch: int) -> int:
     return current_iters
 
 
+class ModelExportCallback(Callback):
+    """
+    Ensures the top-k best models tracked by the CheckpointCallback
+    are also exported as TorchScript (.pt) files for inference.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        # 1. Export the top-k models
+        checkpoint_callback = cast(ModelCheckpoint, trainer.checkpoint_callback)
+        best_k_models = checkpoint_callback.best_k_models  # Dict[path, score]
+
+        input_shape = self.config["model"]["params"].get("input_shape", [3, 6, 7])
+        example_input = torch.randn(1, *input_shape, device=pl_module.device)
+
+        for ckpt_path in best_k_models.keys():
+            # Generate the corresponding .pt path
+            # From: /path/to/checkpoints/alphazero-epoch=02-train_loss=0.50.ckpt
+            # To:   /path/to/checkpoints/alphazero-epoch=02-train_loss=0.50.pt
+            pt_path = ckpt_path.replace(".ckpt", ".pt")
+
+            if not os.path.exists(pt_path):
+                print(f"Exporting top-k checkpoint to TorchScript: {pt_path}")
+                # Load weights from the checkpoint into a temporary state dict
+                checkpoint = torch.load(ckpt_path, map_location=pl_module.device)
+
+                # We need to load these weights into the inner model
+                # PL state_dict prefixes weights with "model."
+                state_dict = checkpoint["state_dict"]
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model."):
+                        new_state_dict[k[6:]] = v
+                    else:
+                        new_state_dict[k] = v
+
+                # Use a clean model instance to avoid side effects
+                # Ensure the exported model outputs probabilities (Softmax)
+                export_params = self.config["model"]["params"].copy()
+                export_params["return_logits"] = False
+                model_to_export = get_model(self.config["model"]["architecture"], export_params)
+                model_to_export.load_state_dict(new_state_dict)
+                model_to_export.to(pl_module.device)
+                model_to_export.eval()
+
+                traced_model = cast(
+                    torch.jit.ScriptModule, torch.jit.trace(model_to_export, example_input)
+                )
+                traced_model.save(pt_path)
+
+
 class SelfPlayCallback(Callback):
     def __init__(self, config, output_dir):
         super().__init__()
@@ -103,15 +157,21 @@ class SelfPlayCallback(Callback):
 
         # Export the latest model for C++ LibTorch use
         export_path = os.path.join(self.output_dir, "current_model.pt")
-        az_module.eval()
 
-        input_shape = self.config["model"]["params"].get("input_shape", [3, 6, 7])
+        # We need a model that outputs probabilities (Softmax) for MCTS
+        export_params = self.config["model"]["params"].copy()
+        export_params["return_logits"] = False
+        inference_model = get_model(self.config["model"]["architecture"], export_params)
+        inference_model.load_state_dict(az_module.model.state_dict())
+        inference_model.to(az_module.device)
+        inference_model.eval()
+
+        input_shape = export_params.get("input_shape", [3, 6, 7])
         example_input = torch.randn(1, *input_shape, device=az_module.device)
 
         # Cast to ScriptModule to resolve .save() attribute error
-        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(az_module.model, example_input))
+        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
         traced_model.save(export_path)
-        az_module.train()
 
         # Invoke the C++ Self-Play engine using scheduled iters
         new_data = execute_self_play(
@@ -174,16 +234,23 @@ def main():
     bootstrap_cfg = config["mcts"].get("bootstrap", {})
     if bootstrap_cfg.get("enabled", False):
         print(f"Generating initial dataset (Pure C++)...")
-        lit_model.eval()
         init_model_path = os.path.join(run_dir, "current_model.pt")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        lit_model.to(device)
-        input_shape = config["model"]["params"].get("input_shape", [3, 6, 7])
+
+        # Ensure the exported model outputs probabilities (Softmax)
+        export_params = config["model"]["params"].copy()
+        export_params["return_logits"] = False
+        inference_model = get_model(config["model"]["architecture"], export_params)
+        inference_model.load_state_dict(lit_model.model.state_dict())
+        inference_model.to(device)
+        inference_model.eval()
+
+        input_shape = export_params.get("input_shape", [3, 6, 7])
         example_input = torch.randn(1, *input_shape, device=device)
-        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(lit_model.model, example_input))
+        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
         traced_model.save(init_model_path)
-        lit_model.train()
+
         # Execute initial self-play games using bootstrap overrides
         init_data = execute_self_play(
             config=config,
@@ -216,6 +283,8 @@ def main():
         reload_dataloaders_every_n_epochs=1,
         callbacks=[
             SelfPlayCallback(config=config, output_dir=run_dir),
+            ModelExportCallback(config=config),
+            LearningRateMonitor(logging_interval="step"),
             checkpoint_callback,
         ],
         logger=[csv_logger, tb_logger],

@@ -33,25 +33,29 @@ class AlphaZeroLightning(pl.LightningModule):
 
         out_pi, out_v = self(states)
 
-        # Policy Loss: Cross Entropy (Assuming out_pi hasn't gone through Softmax or LogSoftmax yet)
-        # If your network ends with raw linear output, using F.cross_entropy directly is more stable
-        loss_pi = -torch.mean(torch.sum(target_pis * torch.log(out_pi + 1e-8), dim=1))
-
+        # Policy Loss: Cross Entropy
+        loss_pi = F.cross_entropy(out_pi, target_pis)
         # Value Loss: Mean Squared Error (MSE)
-        loss_v = F.mse_loss(out_v, target_vs)
+        loss_v = F.mse_loss(out_v.view(-1), target_vs.view(-1))
 
-        loss = loss_pi + loss_v
+        # Total Loss (AdamW handles weight decay)
+        total_loss = loss_pi + loss_v
 
-        # PL automatically logs and displays these values on the progress bar
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("loss_pi", loss_pi)
-        self.log("loss_v", loss_v)
+        # Log weight L2 norm for monitoring
+        with torch.no_grad():
+            l2_norm = sum(p.pow(2.0).sum() for p in self.model.parameters())
+            self.log("weight_l2_norm", l2_norm)
 
-        return loss
+        # PL automatically logs and displays these values
+        self.log("train_loss", total_loss, prog_bar=True)
+        self.log("loss_pi", loss_pi, prog_bar=True)
+        self.log("loss_v", loss_v, prog_bar=True)
+
+        return total_loss
 
     def configure_optimizers(self):
-        # Weight Decay is recommended to prevent overfitting
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        # Use AdamW to handle weight decay automatically
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         return optimizer
 
     def train_dataloader(self):
