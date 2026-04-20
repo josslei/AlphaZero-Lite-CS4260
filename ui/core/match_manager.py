@@ -73,8 +73,8 @@ class MatchManager:
     def start_game(self, p1_strategy: Player, p2_strategy: Player):
         """Starts the game loop as a background task."""
         self.players = {0: p1_strategy, 1: p2_strategy}
-        # Reset the engine state
-        self.engine = type(self.engine)()
+        # Use existing engine instance to maintain external references
+        self.engine.reset()
 
         if self.current_task:
             self.current_task.cancel()
