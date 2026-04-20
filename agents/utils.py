@@ -14,7 +14,7 @@ def select_traditional(child_node: Node, parent_visit_count: int) -> float:
         return float("inf")
 
     # 2. Exploitation term (Expected win rate: Q)
-    exploitation = child_node.mean_value
+    exploitation = -child_node.mean_value
 
     # 3. Exploration term (Increases if child is rarely visited compared to parent)
     exploration = c_param * math.sqrt(math.log(parent_visit_count) / child_node.visit_count)
@@ -26,7 +26,7 @@ def select_alphazero(child_node: Node, parent_visit_count: int) -> float:
     c_puct = 1.0  # Exploration constant (can be tuned or decayed over time)
 
     # 1. Exploitation term (Expected win rate from neural net & searches: Q)
-    exploitation = child_node.mean_value
+    exploitation = -child_node.mean_value
 
     # 2. Exploration term
     # Notice how prior_prob (P) scales the exploration bonus.

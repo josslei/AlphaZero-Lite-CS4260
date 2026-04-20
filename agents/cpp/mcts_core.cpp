@@ -211,7 +211,7 @@ std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *no
         open_spiel::Action action = pair.first;
         Node *child = pair.second.get();
         
-        float q_value = child->visit_count > 0 ? child->mean_value : 0.0f;
+        float q_value = child->visit_count > 0 ? -child->mean_value : 0.0f;
         float u_value = c_puct * child->prior_prob * sqrt_parent_visits / (1.0f + child->visit_count);
         float score = q_value + u_value;
 
