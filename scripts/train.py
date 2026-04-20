@@ -31,8 +31,9 @@ def execute_self_play(
     mcts_cfg = config["mcts"]
     num_games = num_games or mcts_cfg["num_games_per_epoch"]
     num_threads = num_threads or mcts_cfg["num_threads"]
-    num_iters = num_iters or mcts_cfg["num_iters"]
+    num_iters = num_iters or mcts_cfg.get("num_iters", 800)
     batch_size = batch_size or mcts_cfg["batch_size"]
+
     game_name = config["game"]["name"]
 
     print(
@@ -46,6 +47,8 @@ def execute_self_play(
         num_iters=num_iters,
         temperature=mcts_cfg["temperature"],
         c_puct=mcts_cfg["c_puct"],
+        dirichlet_alpha=mcts_cfg.get("dirichlet_alpha", 0.3),
+        dirichlet_epsilon=mcts_cfg.get("dirichlet_epsilon", 0.25),
     )
 
     trajectories = engine.generate_games(num_games=num_games, game_name=game_name)
@@ -58,6 +61,29 @@ def execute_self_play(
     return trajectories
 
 
+def resolve_num_iters(config, current_epoch: int) -> int:
+    """
+    Determines the number of MCTS iterations for the current epoch based on the schedule.
+    Schedule format: [[start_epoch, iters], ...]
+    """
+    mcts_cfg = config["mcts"]
+    schedule = mcts_cfg.get("schedule")
+    if not schedule:
+        return mcts_cfg.get("num_iters", 800)
+
+    # Sort schedule by start_epoch just in case it's not ordered
+    sorted_schedule = sorted(schedule, key=lambda x: x[0])
+
+    current_iters = sorted_schedule[0][1]
+    for start_epoch, iters in sorted_schedule:
+        if current_epoch >= start_epoch:
+            current_iters = iters
+        else:
+            break
+
+    return current_iters
+
+
 class SelfPlayCallback(Callback):
     def __init__(self, config, output_dir):
         super().__init__()
@@ -68,7 +94,12 @@ class SelfPlayCallback(Callback):
         # Cast to our specific class so Pyright sees .model and .replay_buffer
         az_module = cast(AlphaZeroLightning, pl_module)
 
-        print(f"\n>>> [Epoch {trainer.current_epoch}] C++ MCTS Self-Play: START")
+        # Determine num_iters based on schedule
+        num_iters = resolve_num_iters(self.config, trainer.current_epoch)
+
+        print(
+            f"\n>>> [Epoch {trainer.current_epoch}] C++ MCTS Self-Play: START (iters={num_iters})"
+        )
 
         # Export the latest model for C++ LibTorch use
         export_path = os.path.join(self.output_dir, "current_model.pt")
@@ -82,8 +113,10 @@ class SelfPlayCallback(Callback):
         traced_model.save(export_path)
         az_module.train()
 
-        # Invoke the C++ Self-Play engine using epoch settings from config
-        new_data = execute_self_play(config=self.config, model_path=export_path)
+        # Invoke the C++ Self-Play engine using scheduled iters
+        new_data = execute_self_play(
+            config=self.config, model_path=export_path, num_iters=num_iters
+        )
 
         # Load the new data into the Replay Buffer
         for trajectory in new_data:

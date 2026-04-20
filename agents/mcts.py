@@ -148,6 +148,8 @@ class SelfPlayEngine:
         num_iters: int,
         temperature: float,
         c_puct: float = 1.0,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.25,
     ):
         if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
@@ -155,7 +157,14 @@ class SelfPlayEngine:
         # Accessing C++ class via getattr to avoid static analysis errors
         engine_cls: type = getattr(mcts_backend, "SelfPlayEngine")
         self.engine = engine_cls(
-            model_path, batch_size, num_threads, num_iters, temperature, c_puct
+            model_path,
+            batch_size,
+            num_threads,
+            num_iters,
+            temperature,
+            c_puct,
+            dirichlet_alpha,
+            dirichlet_epsilon,
         )
 
     def generate_games(self, num_games: int, game_name: str = "connect_four"):

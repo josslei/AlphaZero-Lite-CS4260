@@ -30,11 +30,13 @@ struct PerfMetrics {
     
     std::atomic<long long> mcts_search_time_us{0};    // Time spent in MCTS logic (excluding eval wait)
     std::atomic<long long> mcts_eval_wait_time_us{0}; // Time spent waiting for NN results
+    std::atomic<long long> iters_saved{0};            // Number of simulations skipped by early stopping
     
     void reset() {
         wait_time_us = 0; cat_time_us = 0; forward_time_us = 0; parse_time_us = 0;
         total_batches = 0; total_requests = 0;
         mcts_search_time_us = 0; mcts_eval_wait_time_us = 0;
+        iters_saved = 0;
     }
 };
 
@@ -94,7 +96,7 @@ struct StepRecord {
 class SelfPlayEngine
 {
 public:
-    SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct);
+    SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon);
     ~SelfPlayEngine();
 
     py::list generate_games(int num_games, const std::string& game_name);
@@ -112,4 +114,6 @@ private:
     int num_iters;
     float temperature;
     float c_puct;
+    float dirichlet_alpha;
+    float dirichlet_epsilon;
 };

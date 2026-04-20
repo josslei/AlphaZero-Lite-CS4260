@@ -12,9 +12,19 @@ mcts:
   # Search parameters
   num_threads: 256
   batch_size: 64
-  num_iters: 400
   temperature: 1.0
   c_puct: 1.0
+
+  # Dirichlet Noise
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.25
+
+  # Iteration Schedule: [start_epoch, num_iters]
+  schedule:
+    - [ 0, 100 ]
+    - [ 5, 400 ]
+    - [ 20, 800 ]
+
   # Workload parameters
   num_games_per_epoch: 256
 
@@ -29,7 +39,7 @@ training:
   learning_rate: 0.001
   weight_decay: 0.0001
   batch_size: 64
-  max_epochs: 100
+  max_epochs: 50
   replay_buffer_size: 50000
 
 system:

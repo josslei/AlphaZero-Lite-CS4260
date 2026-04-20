@@ -153,8 +153,6 @@ void BatchEvaluator::run_inference()
             {
                 EvaluatorResult res;
                 res.value = value_ptr[i];
-                // [FIX] Efficient data parsing: reserve space in map to reduce reallocations
-                // For Connect Four, it's always 7.
                 for (int a = 0; a < num_actions; ++a)
                 {
                     res.policy[a] = policy_ptr[i * num_actions + a];
@@ -176,8 +174,8 @@ void BatchEvaluator::run_inference()
 }
 
 // ---------- SelfPlayEngine ----------
-SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct)
-    : num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct)
+SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon)
+    : num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), dirichlet_alpha(dirichlet_alpha), dirichlet_epsilon(dirichlet_epsilon)
 {
     metrics = std::make_shared<PerfMetrics>();
     evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, metrics);
@@ -246,6 +244,27 @@ void SelfPlayEngine::run_mcts(Node *root, const open_spiel::State& current_state
 {
     for (int i = 0; i < num_iters; ++i)
     {
+        // [FIX] Mathematical Early Stopping
+        // It is mathematically impossible for the leader to be guaranteed before the halfway point.
+        if (i > num_iters / 2 && i % 16 == 0) {
+            int max_v = -1;
+            int second_v = -1;
+            for (auto const& [action, child] : root->children) {
+                if (child->visit_count > max_v) {
+                    second_v = max_v;
+                    max_v = child->visit_count;
+                } else if (child->visit_count > second_v) {
+                    second_v = child->visit_count;
+                }
+            }
+            // If condition met: even if all remaining simulations go to the runner-up, 
+            // the current winner will still have more visits.
+            if (max_v > second_v + (num_iters - i)) {
+                metrics->iters_saved += (num_iters - i);
+                break;
+            }
+        }
+
         Node *cur_node = root;
         std::unique_ptr<open_spiel::State> cur_state = current_state.Clone();
         open_spiel::Player last_player = open_spiel::kInvalidPlayer;
@@ -297,7 +316,30 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
             std::vector<float> obs_vec = state->ObservationTensor();
             torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, 3, 6, 7}, torch::kFloat).clone();
             EvaluatorResult res = evaluator->evaluate(obs);
+            
+            // Standard expansion
             expand_node(root.get(), *state, res.policy);
+
+            // [FIX] Apply Dirichlet Noise to the root's prior probabilities
+            if (dirichlet_epsilon > 0.0f) {
+                std::vector<open_spiel::Action> legal_actions = state->LegalActions();
+                int n = legal_actions.size();
+                if (n > 0) {
+                    std::gamma_distribution<float> gamma_dist(dirichlet_alpha, 1.0f);
+                    std::vector<float> noise(n);
+                    float noise_sum = 0.0f;
+                    for (int j = 0; j < n; ++j) {
+                        noise[j] = gamma_dist(rng);
+                        noise_sum += noise[j];
+                    }
+                    
+                    for (int j = 0; j < n; ++j) {
+                        open_spiel::Action a = legal_actions[j];
+                        float n_val = noise[j] / (noise_sum + 1e-8f);
+                        root->children[a]->prior_prob = (1.0f - dirichlet_epsilon) * root->children[a]->prior_prob + dirichlet_epsilon * n_val;
+                    }
+                }
+            }
         }
 
         run_mcts(root.get(), *state);
@@ -419,6 +461,7 @@ py::list SelfPlayEngine::generate_games(int num_games, const std::string& game_n
     std::cout << "[MCTS Worker Stats (Aggregated across " << num_threads << " threads)]" << std::endl;
     std::cout << "  MCTS Logic Time: " << (search_sec - eval_wait_sec) << " s" << std::endl;
     std::cout << "  Evaluator Wait:  " << eval_wait_sec << " s" << std::endl;
+    std::cout << "  Iterations Saved:" << metrics->iters_saved.load() << std::endl;
     std::cout << "-----------------------------------------------------\n" << std::endl;
 
     py::list py_all_trajectories;
