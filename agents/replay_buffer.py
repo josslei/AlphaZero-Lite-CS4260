@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 import numpy as np
 from collections import deque
 
+
 class ReplayBuffer(Dataset):
     def __init__(self, max_size=50000):
         # deque automatically handles maximum capacity, removing the oldest data when exceeded
@@ -22,7 +23,7 @@ class ReplayBuffer(Dataset):
         state, pi, v = self.buffer[idx]
         # DataLoader requires returning Tensors
         return (
-            torch.FloatTensor(state), 
-            torch.FloatTensor(pi), 
-            torch.FloatTensor([v])  # Keep shape as (1,)
+            torch.FloatTensor(state),
+            torch.FloatTensor(pi),
+            torch.FloatTensor([v]),  # Keep shape as (1,)
         )

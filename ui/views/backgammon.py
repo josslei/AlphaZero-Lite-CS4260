@@ -1,6 +1,7 @@
 import flet as ft
 from components.side_panel import GameSidePanel
 
+
 def BackgammonView(page: ft.Page):
     def handle_restart(e):
         print("Restarting Backgammon game...")
@@ -16,13 +17,15 @@ def BackgammonView(page: ft.Page):
                 [
                     # Side Panel
                     GameSidePanel(page, on_restart=handle_restart),
-                    
                     # Main Game Area Placeholder
                     ft.VerticalDivider(width=1),
                     ft.Column(
                         [
                             ft.Container(
-                                content=ft.Text("Game Board Placeholder", color=ft.Colors.ON_SURFACE_VARIANT),
+                                content=ft.Text(
+                                    "Game Board Placeholder",
+                                    color=ft.Colors.ON_SURFACE_VARIANT,
+                                ),
                                 bgcolor=ft.Colors.SURFACE_BRIGHT,
                                 border_radius=10,
                                 padding=100,

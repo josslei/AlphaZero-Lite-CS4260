@@ -1,5 +1,6 @@
 import flet as ft
 
+
 def HomeView(page: ft.Page):
     def go_connect_four(e):
         page.go("/connect_four")
@@ -23,7 +24,7 @@ def HomeView(page: ft.Page):
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                expand=True
+                expand=True,
             )
         ],
         vertical_alignment=ft.MainAxisAlignment.CENTER,

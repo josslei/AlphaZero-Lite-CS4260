@@ -1,14 +1,15 @@
-from typing import Any, Dict
+from typing import Any
 
-class CppMCTS:
+class SelfPlayEngine:
     def __init__(
         self,
         model_path: str,
+        batch_size: int,
+        num_threads: int,
         num_iters: int,
         temperature: float,
-        num_threads: int = 4,
-        batch_size: int = 8,
         c_puct: float = 1.0,
     ) -> None: ...
-
-    def search(self, game_string: str, history: list[int]) -> Dict[int, float]: ...
+    def generate_games(
+        self, num_games: int, game_name: str = "connect_four"
+    ) -> list[list[tuple[list[float], list[float], float]]]: ...

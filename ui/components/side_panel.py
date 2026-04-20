@@ -2,8 +2,13 @@ import flet as ft
 from typing import Callable, Any
 from core.match_manager import GameMode
 
-def GameSidePanel(page: ft.Page, on_restart: Callable[[Any], None], on_mode_change: Callable[[GameMode], None] = None):
-    
+
+def GameSidePanel(
+    page: ft.Page,
+    on_restart: Callable[[Any], None],
+    on_mode_change: Callable[[GameMode], None] | None = None,
+):
+
     # Map for Enum <-> String display
     MODE_MAP = {
         GameMode.HUMAN_VS_HUMAN: "Human vs. Human",
@@ -18,11 +23,10 @@ def GameSidePanel(page: ft.Page, on_restart: Callable[[Any], None], on_mode_chan
         if on_mode_change and mode_enum:
             on_mode_change(mode_enum)
         print(f"Play mode changed to: {selected_str} ({mode_enum})")
-        
+
     panel_controls: list[ft.Control] = [
         ft.Text("Game Settings", size=20, weight=ft.FontWeight.BOLD),
         ft.Divider(height=20),
-        
         # Play Mode Selection
         ft.Text("Play Mode:", weight=ft.FontWeight.W_500, size=14),
         ft.Dropdown(
@@ -35,19 +39,17 @@ def GameSidePanel(page: ft.Page, on_restart: Callable[[Any], None], on_mode_chan
             width=210,
             text_size=14,
         ),
-        
-        ft.Container(height=30), # Spacer
-        
+        ft.Container(height=30),  # Spacer
         # Restart/Reset Game Button
         ft.ElevatedButton(
-            "Restart Game", 
+            "Restart Game",
             icon=ft.Icons.RESTART_ALT,
             on_click=on_restart,
             width=210,
             style=ft.ButtonStyle(
                 color=ft.Colors.ON_ERROR,
                 bgcolor=ft.Colors.ERROR,
-            )
+            ),
         ),
     ]
 
@@ -59,5 +61,5 @@ def GameSidePanel(page: ft.Page, on_restart: Callable[[Any], None], on_mode_chan
         content=ft.Column(
             controls=panel_controls,
             alignment=ft.MainAxisAlignment.START,
-        )
+        ),
     )

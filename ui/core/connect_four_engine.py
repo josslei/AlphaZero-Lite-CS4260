@@ -1,5 +1,6 @@
 import pyspiel
 
+
 class ConnectFourEngine:
     def __init__(self):
         """Initializes the OpenSpiel Connect Four game and state."""
@@ -33,24 +34,24 @@ class ConnectFourEngine:
 
     def get_winner(self):
         """
-        Returns the winning player index (1 or 2). 
+        Returns the winning player index (1 or 2).
         Returns None if the game is still ongoing or ends in a draw.
         """
         if not self.is_game_over():
             return None
-            
+
         # OpenSpiel returns are a list like [1.0, -1.0] for P1 win.
         returns = self.state.returns()
         if returns[0] == 1.0:
-            return 1 # Player 1 (Red)
+            return 1  # Player 1 (Red)
         elif returns[1] == 1.0:
-            return 2 # Player 2 (Yellow)
-        
-        return None # Draw
+            return 2  # Player 2 (Yellow)
+
+        return None  # Draw
 
     def get_current_player(self):
         """
-        Returns the current player to move. 
+        Returns the current player to move.
         1 for Player 1 (Red), 2 for Player 2 (Yellow).
         """
         # OpenSpiel uses 0 and 1 internally. We map to 1 and 2 for clarity in our UI.
@@ -63,31 +64,31 @@ class ConnectFourEngine:
         0 (empty), 1 (Player 1), 2 (Player 2).
         """
         grid = []
-        
+
         # str(self.state) returns a string like:
         # .......
         # .......
         # ...x...
         # ..ox...
         # .ooxx..
-        board_str = str(self.state).strip().split('\n')
-        
+        board_str = str(self.state).strip().split("\n")
+
         for line in board_str:
             # Ensure we only process the 7-character board lines
-            if len(line) == 7: 
+            if len(line) == 7:
                 row = []
                 for char in line:
-                    if char == 'x':
+                    if char == "x":
                         row.append(1)
-                    elif char == 'o':
+                    elif char == "o":
                         row.append(2)
                     else:
                         row.append(0)
                 grid.append(row)
-        
-        # Safety fallback: if OpenSpiel's string format ever changes, 
+
+        # Safety fallback: if OpenSpiel's string format ever changes,
         # return a blank 6x7 board so the UI doesn't crash.
         if len(grid) != 6:
             return [[0 for _ in range(7)] for _ in range(6)]
-            
+
         return grid

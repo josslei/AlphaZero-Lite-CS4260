@@ -3,7 +3,7 @@ import random
 import numpy as np
 from typing import Any
 from copy import deepcopy
-from agents.mcts import Node, State, PPD
+from .mcts import Node, State, PPD
 
 
 def select_traditional(child_node: Node, parent_visit_count: int) -> float:

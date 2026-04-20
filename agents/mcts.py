@@ -1,13 +1,16 @@
 import random
-import numpy as np
-from typing import Optional, Self, Callable, Protocol, Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
+from typing import Callable, Protocol, Self
+
+import numpy as np
 
 try:
     from . import mcts_backend
+
     USE_CPP = True
 except ImportError:
-    print("Warning: C++ MCTS backend not found.")
+    mcts_backend = None
     USE_CPP = False
 
 
@@ -25,8 +28,8 @@ class State[A](Protocol):
 class Node[A]:
     def __init__(
         self,
-        parent: Optional[Self] = None,
-        children: Optional[MutableMapping[A, Self]] = None,
+        parent: Self | None = None,
+        children: MutableMapping[A, Self] | None = None,
         prior_prob: float = 1.0,
     ):
         # Tree node properties
@@ -137,10 +140,23 @@ class MCTS[S: State, A]:
 
 
 class SelfPlayEngine:
-    def __init__(self, model_path: str, batch_size: int, num_threads: int, num_iters: int, temperature: float, c_puct: float = 1.0):
-        if not USE_CPP:
+    def __init__(
+        self,
+        model_path: str,
+        batch_size: int,
+        num_threads: int,
+        num_iters: int,
+        temperature: float,
+        c_puct: float = 1.0,
+    ):
+        if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
-        self.engine = mcts_backend.SelfPlayEngine(model_path, batch_size, num_threads, num_iters, temperature, c_puct)
-            
+
+        # Accessing C++ class via getattr to avoid static analysis errors
+        engine_cls: type = getattr(mcts_backend, "SelfPlayEngine")
+        self.engine = engine_cls(
+            model_path, batch_size, num_threads, num_iters, temperature, c_puct
+        )
+
     def generate_games(self, num_games: int, game_name: str = "connect_four"):
         return self.engine.generate_games(num_games, game_name)

@@ -4,20 +4,21 @@ from core.match_manager import MatchManager, HumanPlayer, AIPlayer, GameMode
 from core.ai_agent import RandomPolicyAgent
 from components.side_panel import GameSidePanel
 
+
 def CreateGameView(
     page: ft.Page,
     route: str,
     title: str,
     engine_class: Type[Any],
     board_factory: Callable[[ft.Page, Callable[[Any], Any]], Any],
-    agent_class: Type[Any] = RandomPolicyAgent
+    agent_class: Type[Any] = RandomPolicyAgent,
 ):
     """
     A general factory for creating game views (Connect Four, Backgammon, etc.)
     """
     engine = engine_class()
     ai_agent = agent_class()
-    
+
     # Standard players
     h1 = HumanPlayer()
     h2 = HumanPlayer()
@@ -46,15 +47,15 @@ def CreateGameView(
         engine.reset()
         update_board_ui()
         if mode == GameMode.HUMAN_VS_HUMAN:
-            manager.start_match({0: h1, 1: h2})
+            manager.start_game(h1, h2)
         elif mode == GameMode.HUMAN_VS_AI:
-            manager.start_match({0: h1, 1: ai})
+            manager.start_game(h1, ai)
         page.update()
 
     # 2. Setup Board with Human Input Routing
     async def route_click_to_human(action):
-        h1.handle_click(action)
-        h2.handle_click(action)
+        h1.set_move(action)
+        h2.set_move(action)
 
     board_ui, board_updater = board_factory(page, route_click_to_human)
 
@@ -75,7 +76,11 @@ def CreateGameView(
         controls=[
             ft.Row(
                 [
-                    GameSidePanel(page, on_restart=handle_restart, on_mode_change=handle_mode_change),
+                    GameSidePanel(
+                        page,
+                        on_restart=handle_restart,
+                        on_mode_change=handle_mode_change,
+                    ),
                     ft.VerticalDivider(width=1),
                     ft.Column(
                         [
