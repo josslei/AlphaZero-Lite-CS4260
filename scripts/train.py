@@ -102,11 +102,15 @@ class ModelExportCallback(Callback):
         input_shape = self.config["model"]["params"].get("input_shape", [3, 6, 7])
         example_input = torch.randn(1, *input_shape, device=pl_module.device)
 
+        # Track valid .pt paths to keep
+        valid_pt_paths = set()
+
         for ckpt_path in best_k_models.keys():
             # Generate the corresponding .pt path
             # From: /path/to/checkpoints/alphazero-epoch=02-train_loss=0.50.ckpt
             # To:   /path/to/checkpoints/alphazero-epoch=02-train_loss=0.50.pt
             pt_path = ckpt_path.replace(".ckpt", ".pt")
+            valid_pt_paths.add(pt_path)
 
             if not os.path.exists(pt_path):
                 print(f"Exporting top-k checkpoint to TorchScript: {pt_path}")
@@ -136,6 +140,20 @@ class ModelExportCallback(Callback):
                     torch.jit.ScriptModule, torch.jit.trace(model_to_export, example_input)
                 )
                 traced_model.save(pt_path)
+
+        # 2. Cleanup orphaned .pt files
+        # ModelCheckpoint deletes old .ckpt files automatically, but we must delete .pt files
+        ckpt_dir = checkpoint_callback.dirpath
+        if ckpt_dir and os.path.exists(ckpt_dir):
+            for f in os.listdir(ckpt_dir):
+                if f.endswith(".pt") and f.startswith("alphazero-"):
+                    full_path = os.path.join(ckpt_dir, f)
+                    if full_path not in valid_pt_paths:
+                        print(f"Removing orphaned TorchScript checkpoint: {full_path}")
+                        try:
+                            os.remove(full_path)
+                        except OSError:
+                            print(f"[WARNING] Failed to remove model {full_path}")
 
 
 class SelfPlayCallback(Callback):
