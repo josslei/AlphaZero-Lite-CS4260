@@ -1,10 +1,10 @@
 import sys
 import os
 import datetime
-from typing import cast, Any
-
 import torch
 import numpy as np
+import yaml
+import argparse
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
@@ -12,26 +12,29 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 # Add the project root to sys.path so we can import from agents and core
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.networks.connect_four import ConnectFourCNN
+from typing import cast
+import torch.nn as nn
+
+from agents.networks.factory import get_model
 from agents.alphazero import AlphaZeroLightning
 from agents.replay_buffer import ReplayBuffer
 from agents.mcts import SelfPlayEngine
 
-# Set float32 matmul precision for better performance on RTX 4060 (Tensor Cores)
-torch.set_float32_matmul_precision("medium")
-
 
 def execute_self_play(
-    model_path: str,
-    num_games: int = 256,
-    num_threads: int = 128,
-    num_iters: int = 400,
-    batch_size: int = 64,
+    config, model_path, num_games=None, num_threads=None, num_iters=None, batch_size=None
 ) -> list[list[tuple[np.ndarray, np.ndarray, float]]]:
     """
     Simulates self-play games using the Pure C++ SelfPlayEngine.
-    Crank up concurrency to fully utilize high-end GPUs like RTX 4060.
+    Values are taken from config['mcts'] unless overridden.
     """
+    mcts_cfg = config["mcts"]
+    num_games = num_games or mcts_cfg["num_games_per_epoch"]
+    num_threads = num_threads or mcts_cfg["num_threads"]
+    num_iters = num_iters or mcts_cfg["num_iters"]
+    batch_size = batch_size or mcts_cfg["batch_size"]
+    game_name = config["game"]["name"]
+
     print(
         f"Launching C++ SelfPlayEngine: {num_games} games, {num_threads} threads, {num_iters} iters (batch={batch_size})..."
     )
@@ -41,12 +44,11 @@ def execute_self_play(
         batch_size=batch_size,
         num_threads=num_threads,
         num_iters=num_iters,
-        temperature=1.0,
-        c_puct=1.0,
+        temperature=mcts_cfg["temperature"],
+        c_puct=mcts_cfg["c_puct"],
     )
 
-    # Use Any for trajectories to avoid complex type mismatch with C++ return
-    trajectories: Any = engine.generate_games(num_games=num_games, game_name="connect_four")
+    trajectories = engine.generate_games(num_games=num_games, game_name=game_name)
 
     # Explicitly cleanup engine to free C++/LibTorch GPU memory
     del engine
@@ -57,89 +59,111 @@ def execute_self_play(
 
 
 class SelfPlayCallback(Callback):
-    def __init__(self, output_dir: str, num_games: int = 256, mcts_threads: int = 128):
+    def __init__(self, config, output_dir):
         super().__init__()
+        self.config = config
         self.output_dir = output_dir
-        self.num_games = num_games
-        self.mcts_threads = mcts_threads
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        # Cast to our specific class so Pyright sees .model and .replay_buffer
+        az_module = cast(AlphaZeroLightning, pl_module)
+
         print(f"\n>>> [Epoch {trainer.current_epoch}] C++ MCTS Self-Play: START")
 
-        # Cast to our specific module type to access .model and .replay_buffer
-        module = cast(AlphaZeroLightning, pl_module)
-
-        # 1. Export the latest model for C++ LibTorch use
+        # Export the latest model for C++ LibTorch use
         export_path = os.path.join(self.output_dir, "current_model.pt")
-        module.eval()
+        az_module.eval()
 
-        example_input = torch.randn(1, 3, 6, 7, device=module.device)
-        # Cast traced_model to Any to ensure .save() is accessible to Pyright
-        traced_model: Any = torch.jit.trace(module.model, example_input)
+        input_shape = self.config["model"]["params"].get("input_shape", [3, 6, 7])
+        example_input = torch.randn(1, *input_shape, device=az_module.device)
+
+        # Cast to ScriptModule to resolve .save() attribute error
+        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(az_module.model, example_input))
         traced_model.save(export_path)
-        module.train()
+        az_module.train()
 
-        # 2. Invoke the C++ Self-Play engine
-        new_data = execute_self_play(
-            model_path=export_path,
-            num_games=self.num_games,
-            num_threads=self.mcts_threads,
-            num_iters=400,
-            batch_size=64,
-        )
+        # Invoke the C++ Self-Play engine using epoch settings from config
+        new_data = execute_self_play(config=self.config, model_path=export_path)
 
-        # 3. Load the new data into the Replay Buffer
+        # Load the new data into the Replay Buffer
         for trajectory in new_data:
-            module.replay_buffer.push(trajectory)
+            az_module.replay_buffer.push(trajectory)
 
         print(
-            f"<<< [Epoch {trainer.current_epoch}] C++ MCTS Self-Play: END (Pool Size: {len(module.replay_buffer)})"
+            f"<<< [Epoch {trainer.current_epoch}] C++ MCTS Self-Play: END (Pool Size: {len(az_module.replay_buffer)})"
         )
         print(f">>> [Epoch {trainer.current_epoch}] Neural Network Training: START")
 
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+    def on_train_epoch_end(self, trainer, pl_module):
         print(f"<<< [Epoch {trainer.current_epoch}] Neural Network Training: END\n")
 
 
 def main():
-    # 0. Setup output directory
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"run_{timestamp}"
+    parser = argparse.ArgumentParser(description="AlphaZero General Training Script")
+    parser.add_argument("--config", type=str, required=True, help="Path to the YAML config file")
+    args = parser.parse_args()
+
+    # 0. Load Configuration
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+
+    experiment_name = os.path.splitext(os.path.basename(args.config))[0]
     output_root = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs"
     )
-    run_dir = os.path.join(output_root, run_name)
+    run_dir = os.path.join(output_root, experiment_name)
     os.makedirs(run_dir, exist_ok=True)
-    print(f"Starting training run: {run_name}")
+
+    # Save a copy of the config for reproducibility
+    with open(os.path.join(run_dir, "config_dump.yaml"), "w") as f:
+        yaml.dump(config, f)
+
+    print(f"Starting experiment: {experiment_name}")
     print(f"Outputs will be saved to: {run_dir}")
 
-    # 1. Initialize components
-    model = ConnectFourCNN()
-    buffer = ReplayBuffer(max_size=50000)
+    # Set performance precision
+    torch.set_float32_matmul_precision(config["system"].get("precision", "medium"))
 
-    lit_model = AlphaZeroLightning(model=model, replay_buffer=buffer, lr=0.001, batch_size=64)
+    # 1. Initialize components
+    model = get_model(config["model"]["architecture"], config["model"]["params"])
+    buffer = ReplayBuffer(max_size=config["training"]["replay_buffer_size"])
+
+    lit_model = AlphaZeroLightning(
+        model=model,
+        replay_buffer=buffer,
+        lr=config["training"]["learning_rate"],
+        weight_decay=config["training"]["weight_decay"],
+        batch_size=config["training"]["batch_size"],
+    )
 
     # 2. Bootstrap: Initial cold start
-    print("Generating initial dataset (Pure C++)...")
-    lit_model.eval()
-    init_model_path = os.path.join(run_dir, "current_model.pt")
+    # Bootstrap settings are now under config['mcts']['bootstrap']
+    bootstrap_cfg = config["mcts"].get("bootstrap", {})
+    if bootstrap_cfg.get("enabled", False):
+        print(f"Generating initial dataset (Pure C++)...")
+        lit_model.eval()
+        init_model_path = os.path.join(run_dir, "current_model.pt")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lit_model.to(device)
-    example_input = torch.randn(1, 3, 6, 7, device=device)
-    # Cast traced_model to Any to ensure .save() is accessible to Pyright
-    traced_model: Any = torch.jit.trace(lit_model.model, example_input)
-    traced_model.save(init_model_path)
-    lit_model.train()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        lit_model.to(device)
+        input_shape = config["model"]["params"].get("input_shape", [3, 6, 7])
+        example_input = torch.randn(1, *input_shape, device=device)
+        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(lit_model.model, example_input))
+        traced_model.save(init_model_path)
+        lit_model.train()
+        # Execute initial self-play games using bootstrap overrides
+        init_data = execute_self_play(
+            config=config,
+            model_path=init_model_path,
+            num_games=bootstrap_cfg.get("num_games"),
+            num_threads=bootstrap_cfg.get("num_threads"),
+            num_iters=bootstrap_cfg.get("num_iters"),
+            batch_size=bootstrap_cfg.get("batch_size"),
+        )
+        for t in init_data:
+            buffer.push(t)
 
-    # Execute initial self-play games (use high concurrency even for bootstrap)
-    init_data = execute_self_play(
-        init_model_path, num_games=64, num_threads=64, num_iters=100, batch_size=32
-    )
-    for t in init_data:
-        buffer.push(t)
-
-    print(f"Initial dataset ready! Experience pool size: {len(buffer)}")
+        print(f"Initial dataset ready! Experience pool size: {len(buffer)}")
 
     # 3. Configure PyTorch Lightning Trainer
     csv_logger = CSVLogger(save_dir=run_dir, name="logs")
@@ -155,15 +179,15 @@ def main():
 
     trainer = pl.Trainer(
         default_root_dir=run_dir,
-        max_epochs=100,
+        max_epochs=config["training"]["max_epochs"],
         reload_dataloaders_every_n_epochs=1,
         callbacks=[
-            SelfPlayCallback(output_dir=run_dir, num_games=256, mcts_threads=128),
+            SelfPlayCallback(config=config, output_dir=run_dir),
             checkpoint_callback,
         ],
         logger=[csv_logger, tb_logger],
-        accelerator="auto",
-        devices=1,
+        accelerator=config["system"].get("accelerator", "auto"),
+        devices=config["system"].get("devices", 1),
         log_every_n_steps=10,
     )
 

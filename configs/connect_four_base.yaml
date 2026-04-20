@@ -1,0 +1,38 @@
+# Experiment: Connect Four Base
+game:
+  name: "connect_four"
+  params: {}
+
+model:
+  architecture: "ConnectFourCNN"
+  params:
+    input_shape: [ 3, 6, 7 ]
+
+mcts:
+  # Search parameters
+  num_threads: 256
+  batch_size: 64
+  num_iters: 400
+  temperature: 1.0
+  c_puct: 1.0
+  # Workload parameters
+  num_games_per_epoch: 256
+
+  bootstrap:
+    enabled: true
+    num_games: 64
+    num_threads: 64
+    num_iters: 100
+    batch_size: 32
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 64
+  max_epochs: 100
+  replay_buffer_size: 50000
+
+system:
+  accelerator: "auto"
+  devices: 1
+  precision: "medium"
