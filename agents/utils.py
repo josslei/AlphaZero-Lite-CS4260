@@ -1,12 +1,25 @@
 import math
 import random
 import numpy as np
-from typing import Any
+from typing import Any, Protocol, Self, Mapping, TYPE_CHECKING
+from collections.abc import Mapping
 from copy import deepcopy
-from .mcts import Node, State, PPD
+
+if TYPE_CHECKING:
+    from .mcts import Node
+
+type PPD[A] = Mapping[A, float]  # Policy Probability Distribution
 
 
-def select_traditional(child_node: Node, parent_visit_count: int) -> float:
+class State[A](Protocol):
+    def legal_actions(self) -> list[A]: ...
+    def is_terminal(self) -> bool: ...
+    def rewards(self) -> float: ...
+    def apply_action(self, action: A) -> None: ...
+    def clone(self) -> Self: ...
+
+
+def select_traditional(child_node: "Node", parent_visit_count: int) -> float:
     c_param = 1.414  # Exploration constant (commonly sqrt(2))
 
     # 1. Force exploration of completely unvisited nodes

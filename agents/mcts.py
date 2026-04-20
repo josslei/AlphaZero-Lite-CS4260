@@ -5,6 +5,8 @@ from typing import Callable, Protocol, Self
 
 import numpy as np
 
+from .utils import PPD, State
+
 try:
     from . import mcts_backend
 
@@ -12,17 +14,6 @@ try:
 except ImportError:
     mcts_backend = None
     USE_CPP = False
-
-
-type PPD[A] = Mapping[A, float]  # Policy Probability Distribution
-
-
-class State[A](Protocol):
-    def legal_actions(self) -> list[A]: ...
-    def is_terminal(self) -> bool: ...
-    def rewards(self) -> float: ...
-    def apply_action(self, action: A) -> None: ...
-    def clone(self) -> Self: ...
 
 
 class Node[A]:
@@ -61,6 +52,7 @@ class MCTS[S: State, A]:
 
     def search(self, s_init: S):
         root = Node[A](parent=None, prior_prob=1.0)
+        root.visit_count = 1
 
         # Expand root node using eval fn to get initial prior probs
         policy, _ = self.evaluate_fn(s_init)
@@ -68,7 +60,7 @@ class MCTS[S: State, A]:
 
         for _ in range(self.num_iters):
             cur_node = root
-            cur_state = deepcopy(s_init)
+            cur_state = s_init.clone()
 
             # Step 1: Selection
             while cur_node.is_expanded and (not cur_state.is_terminal()):

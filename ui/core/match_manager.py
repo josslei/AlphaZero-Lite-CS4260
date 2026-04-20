@@ -48,7 +48,7 @@ class AIPlayer(Player):
 
     async def get_move(self, state: Any) -> Any:
         # Run agent's decision logic in a background thread
-        return await asyncio.to_thread(self.agent.get_best_move)
+        return await asyncio.to_thread(self.agent.get_best_move, state)
 
     def inform_move(self, state: Any, is_my_move: bool):
         # General hook for AI synchronization/pondering

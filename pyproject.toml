@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "pybind11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "AlphaZero-Lite-CS4260"
+version = "0.1.0"
+authors = [
+  {name = "Joss Lei", email = "qiaosi.lei@vanderbilt.edu"},
+]
+description = "MCTS-based AI project using OpenSpiel."
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "torch",
+    "pyyaml",
+    "flet",
+    "pybind11",
+    "pytorch-lightning",
+    "rich",
+    "tensorboard",
+]
+
+[project.urls]
+Homepage = "https://github.com/josslei/AlphaZero-Lite-CS4260"
+
+[tool.setuptools]
+packages = ["agents", "ui"]

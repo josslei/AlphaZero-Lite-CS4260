@@ -1,7 +1,7 @@
 import flet as ft
 from typing import Any, Callable, Type
 from core.match_manager import MatchManager, HumanPlayer, AIPlayer, GameMode
-from core.ai_agent import RandomPolicyAgent
+from core.ai_agent import RandomPolicyAgent, AlphaZeroAgent
 from components.side_panel import GameSidePanel
 
 
@@ -9,6 +9,7 @@ def CreateGameView(
     page: ft.Page,
     route: str,
     title: str,
+    game_name: str,
     engine_class: Type[Any],
     board_factory: Callable[[ft.Page, Callable[[Any], Any]], Any],
     agent_class: Type[Any] = RandomPolicyAgent,
@@ -17,7 +18,12 @@ def CreateGameView(
     A general factory for creating game views (Connect Four, Backgammon, etc.)
     """
     engine = engine_class()
-    ai_agent = agent_class()
+
+    # Initialize agent
+    if agent_class == AlphaZeroAgent:
+        ai_agent = AlphaZeroAgent(game_name=game_name)
+    else:
+        ai_agent = agent_class()
 
     # Standard players
     h1 = HumanPlayer()
