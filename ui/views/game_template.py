@@ -3,6 +3,7 @@ from typing import Any, Callable, Type
 from core.match_manager import MatchManager, HumanPlayer, AIPlayer, GameMode
 from core.ai_agent import RandomPolicyAgent, AlphaZeroAgent
 from components.side_panel import GameSidePanel
+from components.player_profile import PlayerProfile
 
 
 def CreateGameView(
@@ -12,6 +13,8 @@ def CreateGameView(
     game_name: str,
     engine_class: Type[Any],
     board_factory: Callable[[ft.Page, Callable[[Any], Any]], Any],
+    p1_global: Any,
+    p2_global: Any,
     agent_class: Type[Any] = RandomPolicyAgent,
 ):
     """
@@ -40,35 +43,88 @@ def CreateGameView(
         board_ui.disabled = is_ai_turn
         page.update()
 
+    # 1. Setup MatchManager
     def update_board_ui():
+        # Update turn indicator
+        current_p = engine.get_current_player() - 1
+        p1_profile.visible_indicator(current_p == 0)
+        p2_profile.visible_indicator(current_p == 1)
+
         # General assumption: engine has a get_board_grid() or similar
         board_updater(engine.get_board_grid())
+        page.update()
 
-    # 1. Setup MatchManager
     manager = MatchManager(engine, on_update=update_board_ui, page=page)
     manager.on_game_over = on_game_over
     manager.on_ai_thinking = toggle_board_input
 
+    # 2. Setup Profiles with persistence sync
+    def on_p1_name_change(new_name):
+        p1_global.name = new_name
+
+    def on_p2_name_change(new_name):
+        p2_global.name = new_name
+
+    p1_profile = PlayerProfile(
+        p1_global.get_display_name(), p1_global.icon, on_name_change=on_p1_name_change
+    )
+    p2_profile = PlayerProfile(
+        p2_global.get_display_name(), p2_global.icon, on_name_change=on_p2_name_change
+    )
+
+    def handle_iters_change(new_iters):
+        if isinstance(ai_agent, AlphaZeroAgent):
+            ai_agent.update_iters(new_iters)
+
+    # 3. Setup Side Panel
+    side_panel = GameSidePanel(
+        page,
+        on_restart=lambda e: start_game_based_on_mode(match_state["mode"]),
+        on_mode_change=lambda mode: handle_mode_change(mode),
+        on_iters_change=handle_iters_change,
+        initial_iters=getattr(ai_agent, "num_iters", 100),
+    )
+
     def start_game_based_on_mode(mode: GameMode):
         engine.reset()
+
+        # P1 logic
+        if mode == GameMode.HUMAN_VS_HUMAN:
+            p1_name = p1_global.name if p1_global.name else "Human Player 1"
+        else:
+            p1_name = p1_global.name if p1_global.name else "Human Player"
+
+        p1_profile.update_profile(name=p1_name, icon=ft.Icons.PERSON, is_human=True)
+
+        # P2 logic
+        if mode == GameMode.HUMAN_VS_HUMAN:
+            p2_name = p2_global.name if p2_global.name else "Human Player 2"
+            p2_icon = ft.Icons.PERSON
+            p2_is_human = True
+        else:
+            p2_name = "AlphaZero"  # AI name is fixed unless we want it editable
+            p2_icon = ft.Icons.SMART_TOY
+            p2_is_human = False
+
+        p2_profile.update_profile(name=p2_name, icon=p2_icon, is_human=p2_is_human)
+
         update_board_ui()
+        page.update()
+
         if mode == GameMode.HUMAN_VS_HUMAN:
             manager.start_game(h1, h2)
         elif mode == GameMode.HUMAN_VS_AI:
             manager.start_game(h1, ai)
         page.update()
 
-    # 2. Setup Board with Human Input Routing
+    # 4. Setup Board with Human Input Routing
     async def route_click_to_human(action):
         h1.set_move(action)
         h2.set_move(action)
 
     board_ui, board_updater = board_factory(page, route_click_to_human)
 
-    # 3. Handle UI interactions
-    def handle_restart(e):
-        start_game_based_on_mode(match_state["mode"])
-
+    # 5. Handle UI interactions
     def handle_mode_change(new_mode: GameMode):
         match_state["mode"] = new_mode
         start_game_based_on_mode(new_mode)
@@ -82,22 +138,23 @@ def CreateGameView(
         controls=[
             ft.Row(
                 [
-                    GameSidePanel(
-                        page,
-                        on_restart=handle_restart,
-                        on_mode_change=handle_mode_change,
-                    ),
+                    side_panel,
                     ft.VerticalDivider(width=1),
                     ft.Column(
                         [
+                            # Use ft.Container for top padding, then P2
+                            ft.Container(content=p2_profile, alignment=ft.Alignment(-1, -1)),
+                            # The main board area expands to fill all available space
                             ft.Container(
                                 content=board_ui,
                                 bgcolor=ft.Colors.SURFACE_BRIGHT,
                                 border_radius=10,
                                 padding=40,
                                 expand=True,
-                                alignment=ft.alignment.Alignment.CENTER,
+                                alignment=ft.Alignment(0, 0),
                             ),
+                            # P1 at the bottom
+                            ft.Container(content=p1_profile, alignment=ft.Alignment(-1, 1)),
                         ],
                         alignment=ft.MainAxisAlignment.CENTER,
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,

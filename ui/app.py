@@ -1,5 +1,20 @@
 import flet as ft
 
+
+# Global profile state to persist across views
+class GlobalProfile:
+    def __init__(self, default_name, default_icon):
+        self.name = None  # User custom name
+        self.default_name = default_name
+        self.icon = default_icon
+
+    def get_display_name(self):
+        return self.name if self.name else self.default_name
+
+
+p1_global = GlobalProfile("Human Player", ft.Icons.PERSON)
+p2_global = GlobalProfile("AlphaZero", ft.Icons.SMART_TOY)
+
 # Import all of our modularized views
 from views.home import HomeView
 from views.connect_four import ConnectFourView
@@ -10,7 +25,7 @@ async def main(page: ft.Page):
     page.title = "AlphaZero Games"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.window.width = 1000
-    page.window.height = 600
+    page.window.height = 700
     page.window.resizable = False
 
     def route_change(e):
@@ -20,11 +35,14 @@ async def main(page: ft.Page):
         # Always add HomeView as the base underlying view
         page.views.append(HomeView(page))
 
+        # Shared kwargs for game views
+        game_kwargs = {"p1_global": p1_global, "p2_global": p2_global}
+
         # Append the specific game view on top if navigating to them
         if page.route == "/connect_four":
-            page.views.append(ConnectFourView(page))
+            page.views.append(ConnectFourView(page, **game_kwargs))
         elif page.route == "/backgammon":
-            page.views.append(BackgammonView(page))
+            page.views.append(BackgammonView(page, **game_kwargs))
 
         page.update()
 

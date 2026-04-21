@@ -95,14 +95,12 @@ class MatchManager:
             if self.on_ai_thinking:
                 self.on_ai_thinking(isinstance(current_player, AIPlayer))
 
-            # Get move from the strategy (Human or AI)
+            # Request move from the Player strategy
             action = await current_player.get_move(self.engine.state)
 
-            # Apply action to engine
-            if action is not None:
-                self.engine.state.apply_action(action)
-
-                # Inform all players of the move
+            # Apply move to engine (this handles validation)
+            if self.engine.apply_move(action):
+                # Notify ALL players of the NEW state
                 for pid, p in self.players.items():
                     p.inform_move(self.engine.state, is_my_move=(pid == p_id))
 

@@ -7,6 +7,8 @@ def GameSidePanel(
     page: ft.Page,
     on_restart: Callable[[Any], None],
     on_mode_change: Callable[[GameMode], None] | None = None,
+    on_iters_change: Callable[[int], None] | None = None,
+    initial_iters: int = 100,
 ):
 
     # Map for Enum <-> String display
@@ -17,9 +19,34 @@ def GameSidePanel(
     # Inverse map to get Enum from the Dropdown string value
     STR_TO_MODE = {v: k for k, v in MODE_MAP.items()}
 
+    def iters_changed(e):
+        if on_iters_change:
+            val = e.control.value
+            if val == "":
+                return
+            if val.isdigit():
+                on_iters_change(int(val))
+
+    # AI Config Section (MCTS iterations)
+    iters_input = ft.TextField(
+        label="MCTS Iterations",
+        value=str(initial_iters),
+        on_change=iters_changed,
+        width=210,
+        text_size=14,
+        input_filter=ft.NumbersOnlyInputFilter(),
+        keyboard_type=ft.KeyboardType.NUMBER,
+        visible=True,
+    )
+
     def mode_changed(e):
         selected_str = e.control.value
         mode_enum = STR_TO_MODE.get(selected_str)
+
+        # Toggle iterations input visibility
+        iters_input.visible = mode_enum == GameMode.HUMAN_VS_AI
+        iters_input.update()
+
         if on_mode_change and mode_enum:
             on_mode_change(mode_enum)
         print(f"Play mode changed to: {selected_str} ({mode_enum})")
@@ -39,7 +66,9 @@ def GameSidePanel(
             width=210,
             text_size=14,
         ),
-        ft.Container(height=30),  # Spacer
+        ft.Container(height=10),
+        iters_input,
+        ft.Column(expand=True, controls=[]),  # Spacer to push button down
         # Restart/Reset Game Button
         ft.ElevatedButton(
             "Restart Game",

@@ -47,7 +47,7 @@ class RandomPolicyAgent(Agent):
 
 
 class AlphaZeroAgent(Agent):
-    def __init__(self, game_name: str, model_path: str | None = None, num_iters: int = 800):
+    def __init__(self, game_name: str, model_path: str | None = None, num_iters: int = 100):
         super().__init__()
         self.cur_state: State | None = None
         self.num_iters = num_iters
@@ -78,6 +78,12 @@ class AlphaZeroAgent(Agent):
         )
         model_path = os.path.join(base_path, f"{self.game_name}.pt")
         return model_path if os.path.exists(model_path) else None
+
+    def update_iters(self, num_iters: int):
+        self.num_iters = num_iters
+        if self.mcts is not None:
+            self.mcts.num_iters = num_iters
+        print(f"AlphaZeroAgent ({self.game_name}): num_iters updated to {num_iters}")
 
     def get_best_move(self, state: State, think_time_limit=1.0) -> Any:
         self.cur_state = state
