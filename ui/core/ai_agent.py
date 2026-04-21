@@ -4,9 +4,9 @@ import os
 import glob
 from typing import Any
 
+from agents.inference import PyspielStateWrapper, AlphaZeroEvaluator
 from agents.mcts import MCTS
 from agents.utils import select_alphazero, State, PPD
-from agents.inference import PyspielStateWrapper, AlphaZeroEvaluator
 
 
 class Agent:
@@ -73,8 +73,10 @@ class AlphaZeroAgent(Agent):
 
     def _find_latest_model(self) -> str | None:
         # Fixed place for each game: outputs/<game_name>/<game_name>.pt
-        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../outputs"))
-        model_path = os.path.join(base_path, self.game_name, f"{self.game_name}.pt")
+        base_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../outputs/best_models")
+        )
+        model_path = os.path.join(base_path, f"{self.game_name}.pt")
         return model_path if os.path.exists(model_path) else None
 
     def get_best_move(self, state: State, think_time_limit=1.0) -> Any:

@@ -35,7 +35,7 @@ def select_traditional(child_node: "Node", parent_visit_count: int) -> float:
     return exploitation + exploration
 
 
-def select_alphazero(child_node: Node, parent_visit_count: int) -> float:
+def select_alphazero(child_node: "Node", parent_visit_count: int) -> float:
     c_puct = 1.0  # Exploration constant (can be tuned or decayed over time)
 
     # 1. Exploitation term (Expected win rate from neural net & searches: Q)
