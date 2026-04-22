@@ -73,8 +73,7 @@ class MatchManager:
     def start_game(self, p1_strategy: Player, p2_strategy: Player):
         """Starts the game loop as a background task."""
         self.players = {0: p1_strategy, 1: p2_strategy}
-        # Use existing engine instance to maintain external references
-        self.engine.reset()
+        # Engine is already reset by the caller (start_game_based_on_mode)
 
         if self.current_task:
             self.current_task.cancel()
@@ -94,6 +93,11 @@ class MatchManager:
             # Notify UI if AI is thinking
             if self.on_ai_thinking:
                 self.on_ai_thinking(isinstance(current_player, AIPlayer))
+
+            # Refresh UI at the start of each turn (ensures move panel is correct)
+            if self.on_update:
+                self.on_update()
+            self.page.update()
 
             # Request move from the Player strategy
             action = await current_player.get_move(self.engine.state)

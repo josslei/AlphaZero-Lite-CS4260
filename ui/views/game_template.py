@@ -4,6 +4,7 @@ from core.match_manager import MatchManager, HumanPlayer, AIPlayer, GameMode
 from core.ai_agent import RandomPolicyAgent, AlphaZeroAgent
 from components.side_panel import GameSidePanel
 from components.player_profile import PlayerProfile
+from components.move_selector import MoveSelector
 
 
 def CreateGameView(
@@ -51,7 +52,22 @@ def CreateGameView(
         p2_profile.visible_indicator(current_p == 1)
 
         # General assumption: engine has a get_board_grid() or similar
-        board_updater(engine.get_board_grid())
+        data = engine.get_board_grid()
+        if isinstance(data, dict):
+            # For games with complex boards (e.g. Backgammon),
+            # the engine returns a dict of arguments for the updater.
+            # We remove extra keys like 'dice' if the updater doesn't take them,
+            # but BackgammonBoard.update_board might not take 'dice'.
+            # Let's check BackgammonBoard signature.
+            import inspect
+
+            sig = inspect.signature(board_updater)
+            filtered_data = {k: v for k, v in data.items() if k in sig.parameters}
+            board_updater(**filtered_data)
+        else:
+            board_updater(data)
+
+        update_move_panel()
         page.update()
 
     manager = MatchManager(engine, on_update=update_board_ui, page=page)
@@ -72,6 +88,23 @@ def CreateGameView(
         p2_global.get_display_name(), p2_global.icon, on_name_change=on_p2_name_change
     )
 
+    # 2.5 Setup Move Selection Panel (For complex games like Backgammon)
+    def on_move_submitted(aid):
+        h1.set_move(aid)
+        h2.set_move(aid)
+
+    move_selector = MoveSelector(on_move_selected=on_move_submitted)
+
+    def update_move_panel():
+        current_p = engine.get_current_player() - 1
+        is_human_turn = not isinstance(manager.players.get(current_p), AIPlayer)
+
+        if is_human_turn and hasattr(engine, "get_legal_moves_with_names"):
+            moves = engine.get_legal_moves_with_names()
+            move_selector.update_moves(moves)
+        else:
+            move_selector.visible = False
+
     def handle_iters_change(new_iters):
         if isinstance(ai_agent, AlphaZeroAgent):
             ai_agent.update_iters(new_iters)
@@ -86,7 +119,11 @@ def CreateGameView(
     )
 
     def start_game_based_on_mode(mode: GameMode):
-        engine.reset()
+        # In Human vs AI, force the human (player 0) to go first
+        if mode == GameMode.HUMAN_VS_AI:
+            engine.reset(force_first_player=0)
+        else:
+            engine.reset()
 
         # P1 logic
         if mode == GameMode.HUMAN_VS_HUMAN:
@@ -145,13 +182,27 @@ def CreateGameView(
                             # Use ft.Container for top padding, then P2
                             ft.Container(content=p2_profile, alignment=ft.Alignment(-1, -1)),
                             # The main board area expands to fill all available space
-                            ft.Container(
-                                content=board_ui,
-                                bgcolor=ft.Colors.SURFACE_BRIGHT,
-                                border_radius=10,
-                                padding=40,
+                            ft.Row(
+                                [
+                                    ft.Container(
+                                        content=ft.Container(
+                                            content=board_ui,
+                                            padding=20,
+                                        ),
+                                        bgcolor=ft.Colors.SURFACE_BRIGHT,
+                                        border_radius=10,
+                                        expand=True,
+                                        alignment=ft.alignment.Alignment.CENTER,
+                                    ),
+                                    # Move Panel on the right
+                                    ft.Container(
+                                        content=move_selector,
+                                        width=200,  # Fixed width for the list
+                                        expand=False,
+                                    ),
+                                ],
                                 expand=True,
-                                alignment=ft.Alignment(0, 0),
+                                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
                             ),
                             # P1 at the bottom
                             ft.Container(content=p1_profile, alignment=ft.Alignment(-1, 1)),

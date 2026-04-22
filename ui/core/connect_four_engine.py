@@ -7,7 +7,7 @@ class ConnectFourEngine:
         self.game = pyspiel.load_game("connect_four")
         self.state = self.game.new_initial_state()
 
-    def reset(self):
+    def reset(self, **kwargs):
         """Resets the game to the starting state."""
         self.state = self.game.new_initial_state()
 
