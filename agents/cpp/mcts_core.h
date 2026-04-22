@@ -4,7 +4,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <vector>
-#include <map>
+#include "absl/container/flat_hash_map.h"
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -42,34 +42,41 @@ struct PerfMetrics {
 
 struct EvaluatorResult
 {
-    std::map<open_spiel::Action, float> policy;
+    absl::flat_hash_map<open_spiel::Action, float> policy;
     float value;
 };
 
 struct EvalRequest {
-    torch::Tensor state;
+    int slot_index;                   // Index into the pre-allocated batch buffer
     std::promise<EvaluatorResult> promise;
 };
 
 class BatchEvaluator
 {
 public:
-    BatchEvaluator(const std::string &model_path, int batch_size, int obs_flat_size, std::shared_ptr<PerfMetrics> metrics);
+    BatchEvaluator(const std::string &model_path, int batch_size, int obs_flat_size, std::shared_ptr<PerfMetrics> metrics, bool use_fp16 = false);
     ~BatchEvaluator();
 
-    EvaluatorResult evaluate(const torch::Tensor &state);
+    EvaluatorResult evaluate(const float* obs_data);
     void run_inference();
 
 private:
     torch::jit::script::Module model;
     int batch_size;
     int obs_flat_size;
+    bool use_fp16;
     bool stop_flag = false;
+    torch::Device device{torch::kCPU};
+
+    // Pre-allocated batch buffer (CPU pinned memory) and slot tracking
+    torch::Tensor batch_buffer;                           // [batch_size, obs_flat_size] pinned CPU
+    std::vector<std::promise<EvaluatorResult>> slot_promises;
+    int next_slot = 0;
 
     std::mutex m_mutex;
     std::condition_variable cv_batch;
+    std::condition_variable cv_slot;  // Notify when slots are available after inference
 
-    std::queue<EvalRequest> queue;
     std::thread worker_thread;
     std::shared_ptr<PerfMetrics> metrics;
 };
@@ -77,7 +84,7 @@ private:
 struct Node
 {
     Node *parent;
-    std::map<open_spiel::Action, std::unique_ptr<Node>> children;
+    absl::flat_hash_map<open_spiel::Action, std::unique_ptr<Node>> children;
     bool is_expanded = false;
 
     int visit_count = 0;
@@ -97,16 +104,16 @@ struct StepRecord {
 class SelfPlayEngine
 {
 public:
-    SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon);
+    SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon, bool use_fp16 = false, bool use_undo = false);
     ~SelfPlayEngine();
 
     py::list generate_games(int num_games, const std::string& game_name);
 
 private:
     void play_game(const std::string& game_name, std::vector<std::vector<std::tuple<std::vector<float>, std::vector<float>, float>>>& all_trajectories, std::mutex& traj_mutex);
-    void run_mcts(Node *root, const open_spiel::State& current_state);
+    void run_mcts(Node *root, open_spiel::State& current_state);
     std::pair<open_spiel::Action, Node *> select_best_child(Node *node);
-    void expand_node(Node *node, const open_spiel::State& state, const std::map<open_spiel::Action, float> &policy);
+    void expand_node(Node *node, const open_spiel::State& state, const absl::flat_hash_map<open_spiel::Action, float> &policy);
     void backpropagate(Node *node, float value);
 
     std::shared_ptr<BatchEvaluator> evaluator;
@@ -118,4 +125,5 @@ private:
     float c_puct;
     float dirichlet_alpha;
     float dirichlet_epsilon;
+    bool use_undo;
 };

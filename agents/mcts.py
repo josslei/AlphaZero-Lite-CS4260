@@ -143,6 +143,8 @@ class SelfPlayEngine:
         c_puct: float = 1.0,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        use_fp16: bool = False,
+        use_undo: bool = False,
     ):
         if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
@@ -159,6 +161,8 @@ class SelfPlayEngine:
             c_puct,
             dirichlet_alpha,
             dirichlet_epsilon,
+            use_fp16,
+            use_undo,
         )
 
     def generate_games(self, num_games: int, game_name: str = "connect_four"):

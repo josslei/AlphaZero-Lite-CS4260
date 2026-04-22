@@ -14,6 +14,7 @@ class AlphaZeroLightning(pl.LightningModule):
         lr: float = 0.001,
         weight_decay: float = 1e-4,
         batch_size: int = 64,
+        num_workers: int = 0,
     ):
         super().__init__()
         self.model = model
@@ -21,6 +22,7 @@ class AlphaZeroLightning(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.batch_size = batch_size
+        self.num_workers = num_workers
 
         # Tell PyTorch Lightning (PL) to save hyperparameters (excluding model and buffer objects)
         self.save_hyperparameters(ignore=["model", "replay_buffer"])
@@ -59,9 +61,16 @@ class AlphaZeroLightning(pl.LightningModule):
         return optimizer
 
     def train_dataloader(self):
-        # Bind the Dataloader within the Module
-        # Note: num_workers=0 is used to prevent multiprocessing from messing with the deque.
-        # Consider multiprocessing only if the dataset becomes extremely large.
+        # Snapshot the deque into contiguous tensors for multi-worker DataLoader.
+        # This is rebuilt every epoch (reload_dataloaders_every_n_epochs=1) to
+        # reflect newly added self-play data.
+        states, pis, vs = self.replay_buffer.snapshot_to_tensors()
+        dataset = torch.utils.data.TensorDataset(states, pis, vs)
         return DataLoader(
-            self.replay_buffer, batch_size=self.batch_size, shuffle=True, num_workers=0
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
         )

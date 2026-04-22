@@ -47,6 +47,9 @@ def execute_self_play(
         f"Launching C++ SelfPlayEngine: {num_games} games, {num_threads} threads, {num_iters} iters (batch={batch_size})..."
     )
 
+    use_fp16 = config["system"].get("use_fp16", False)
+    use_undo = mcts_cfg.get("use_undo", False)
+
     engine = SelfPlayEngine(
         model_path=model_path,
         batch_size=batch_size,
@@ -57,6 +60,8 @@ def execute_self_play(
         c_puct=mcts_cfg["c_puct"],
         dirichlet_alpha=mcts_cfg.get("dirichlet_alpha", 0.3),
         dirichlet_epsilon=mcts_cfg.get("dirichlet_epsilon", 0.25),
+        use_fp16=use_fp16,
+        use_undo=use_undo,
     )
 
     trajectories = engine.generate_games(num_games=num_games, game_name=game_name)
@@ -108,7 +113,9 @@ class ModelExportCallback(Callback):
         checkpoint_callback = cast(ModelCheckpoint, trainer.checkpoint_callback)
         best_k_models = checkpoint_callback.best_k_models  # Dict[path, score]
 
-        example_input = torch.randn(1, self.obs_flat_size, device=pl_module.device)
+        use_fp16 = self.config["system"].get("use_fp16", False)
+        input_dtype = torch.float16 if use_fp16 else torch.float32
+        example_input = torch.randn(1, self.obs_flat_size, device=pl_module.device, dtype=input_dtype)
 
         # Track valid .pt paths to keep
         valid_pt_paths = set()
@@ -143,10 +150,13 @@ class ModelExportCallback(Callback):
                 model_to_export.load_state_dict(new_state_dict)
                 model_to_export.to(pl_module.device)
                 model_to_export.eval()
+                if use_fp16:
+                    model_to_export.half()
 
                 traced_model = cast(
                     torch.jit.ScriptModule, torch.jit.trace(model_to_export, example_input)
                 )
+                traced_model = torch.jit.optimize_for_inference(traced_model)
                 traced_model.save(pt_path)
 
         # 2. Cleanup orphaned .pt files
@@ -193,10 +203,16 @@ class SelfPlayCallback(Callback):
         inference_model.to(az_module.device)
         inference_model.eval()
 
-        example_input = torch.randn(1, self.obs_flat_size, device=az_module.device)
+        use_fp16 = self.config["system"].get("use_fp16", False)
+        if use_fp16:
+            inference_model.half()
+
+        input_dtype = torch.float16 if use_fp16 else torch.float32
+        example_input = torch.randn(1, self.obs_flat_size, device=az_module.device, dtype=input_dtype)
 
         # Cast to ScriptModule to resolve .save() attribute error
         traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
+        traced_model = torch.jit.optimize_for_inference(traced_model)
         traced_model.save(export_path)
 
         # Invoke the C++ Self-Play engine using scheduled iters
@@ -259,6 +275,7 @@ def main():
         lr=config["training"]["learning_rate"],
         weight_decay=config["training"]["weight_decay"],
         batch_size=config["training"]["batch_size"],
+        num_workers=config["training"].get("num_workers", 0),
     )
 
     # 2. Bootstrap: Initial cold start
@@ -278,8 +295,14 @@ def main():
         inference_model.to(device)
         inference_model.eval()
 
-        example_input = torch.randn(1, obs_flat_size, device=device)
+        use_fp16 = config["system"].get("use_fp16", False)
+        if use_fp16:
+            inference_model.half()
+
+        input_dtype = torch.float16 if use_fp16 else torch.float32
+        example_input = torch.randn(1, obs_flat_size, device=device, dtype=input_dtype)
         traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
+        traced_model = torch.jit.optimize_for_inference(traced_model)
         traced_model.save(init_model_path)
 
         # Execute initial self-play games using bootstrap overrides

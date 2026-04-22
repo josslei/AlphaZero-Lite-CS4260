@@ -29,6 +29,9 @@ mcts:
   # Workload parameters
   num_games_per_epoch: 256
 
+  # In-place ApplyAction/UndoAction (only for games that implement UndoAction)
+  use_undo: false
+
   bootstrap:
     enabled: true
     num_games: 64
@@ -42,8 +45,10 @@ training:
   batch_size: 64
   max_epochs: 50
   replay_buffer_size: 50000
+  num_workers: 4
 
 system:
   accelerator: "auto"
   devices: 1
   precision: "medium"
+  use_fp16: false
