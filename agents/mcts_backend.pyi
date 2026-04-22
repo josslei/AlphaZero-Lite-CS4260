@@ -5,10 +5,13 @@ class SelfPlayEngine:
         self,
         model_path: str,
         batch_size: int,
+        obs_flat_size: int,
         num_threads: int,
         num_iters: int,
         temperature: float,
         c_puct: float = 1.0,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_epsilon: float = 0.25,
     ) -> None: ...
     def generate_games(
         self, num_games: int, game_name: str = "connect_four"

@@ -136,6 +136,7 @@ class SelfPlayEngine:
         self,
         model_path: str,
         batch_size: int,
+        obs_flat_size: int,
         num_threads: int,
         num_iters: int,
         temperature: float,
@@ -151,6 +152,7 @@ class SelfPlayEngine:
         self.engine = engine_cls(
             model_path,
             batch_size,
+            obs_flat_size,
             num_threads,
             num_iters,
             temperature,

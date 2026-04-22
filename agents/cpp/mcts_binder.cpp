@@ -6,9 +6,10 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(mcts_backend, m) {
     py::class_<SelfPlayEngine>(m, "SelfPlayEngine")
-        .def(py::init<const std::string&, int, int, int, float, float, float, float>(),
+        .def(py::init<const std::string&, int, int, int, int, float, float, float, float>(),
              py::arg("model_path"),
              py::arg("batch_size"),
+             py::arg("obs_flat_size"),
              py::arg("num_threads"),
              py::arg("num_iters"),
              py::arg("temperature"),

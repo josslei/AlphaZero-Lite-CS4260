@@ -19,10 +19,17 @@ from agents.networks.factory import get_model
 from agents.alphazero import AlphaZeroLightning
 from agents.replay_buffer import ReplayBuffer
 from agents.mcts import SelfPlayEngine
+from agents.game_spec import get_game_spec
 
 
 def execute_self_play(
-    config, model_path, num_games=None, num_threads=None, num_iters=None, batch_size=None
+    config,
+    model_path,
+    obs_flat_size,
+    num_games=None,
+    num_threads=None,
+    num_iters=None,
+    batch_size=None,
 ) -> list[list[tuple[np.ndarray, np.ndarray, float]]]:
     """
     Simulates self-play games using the Pure C++ SelfPlayEngine.
@@ -43,6 +50,7 @@ def execute_self_play(
     engine = SelfPlayEngine(
         model_path=model_path,
         batch_size=batch_size,
+        obs_flat_size=obs_flat_size,
         num_threads=num_threads,
         num_iters=num_iters,
         temperature=mcts_cfg["temperature"],
@@ -90,17 +98,17 @@ class ModelExportCallback(Callback):
     are also exported as TorchScript (.pt) files for inference.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, obs_flat_size):
         super().__init__()
         self.config = config
+        self.obs_flat_size = obs_flat_size
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         # 1. Export the top-k models
         checkpoint_callback = cast(ModelCheckpoint, trainer.checkpoint_callback)
         best_k_models = checkpoint_callback.best_k_models  # Dict[path, score]
 
-        input_shape = self.config["model"]["params"].get("input_shape", [3, 6, 7])
-        example_input = torch.randn(1, *input_shape, device=pl_module.device)
+        example_input = torch.randn(1, self.obs_flat_size, device=pl_module.device)
 
         # Track valid .pt paths to keep
         valid_pt_paths = set()
@@ -157,10 +165,11 @@ class ModelExportCallback(Callback):
 
 
 class SelfPlayCallback(Callback):
-    def __init__(self, config, output_dir):
+    def __init__(self, config, output_dir, obs_flat_size):
         super().__init__()
         self.config = config
         self.output_dir = output_dir
+        self.obs_flat_size = obs_flat_size
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         # Cast to our specific class so Pyright sees .model and .replay_buffer
@@ -184,8 +193,7 @@ class SelfPlayCallback(Callback):
         inference_model.to(az_module.device)
         inference_model.eval()
 
-        input_shape = export_params.get("input_shape", [3, 6, 7])
-        example_input = torch.randn(1, *input_shape, device=az_module.device)
+        example_input = torch.randn(1, self.obs_flat_size, device=az_module.device)
 
         # Cast to ScriptModule to resolve .save() attribute error
         traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
@@ -193,7 +201,10 @@ class SelfPlayCallback(Callback):
 
         # Invoke the C++ Self-Play engine using scheduled iters
         new_data = execute_self_play(
-            config=self.config, model_path=export_path, num_iters=num_iters
+            config=self.config,
+            model_path=export_path,
+            obs_flat_size=self.obs_flat_size,
+            num_iters=num_iters,
         )
 
         # Load the new data into the Replay Buffer
@@ -236,8 +247,11 @@ def main():
     torch.set_float32_matmul_precision(config["system"].get("precision", "medium"))
 
     # 1. Initialize components
+    game_spec = get_game_spec(config["game"]["name"])
+    obs_flat_size = game_spec.obs_flat_size
+
     model = get_model(config["model"]["architecture"], config["model"]["params"])
-    buffer = ReplayBuffer(max_size=config["training"]["replay_buffer_size"])
+    buffer = ReplayBuffer(max_size=config["training"]["replay_buffer_size"], game_spec=game_spec)
 
     lit_model = AlphaZeroLightning(
         model=model,
@@ -264,8 +278,7 @@ def main():
         inference_model.to(device)
         inference_model.eval()
 
-        input_shape = export_params.get("input_shape", [3, 6, 7])
-        example_input = torch.randn(1, *input_shape, device=device)
+        example_input = torch.randn(1, obs_flat_size, device=device)
         traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
         traced_model.save(init_model_path)
 
@@ -273,6 +286,7 @@ def main():
         init_data = execute_self_play(
             config=config,
             model_path=init_model_path,
+            obs_flat_size=obs_flat_size,
             num_games=bootstrap_cfg.get("num_games"),
             num_threads=bootstrap_cfg.get("num_threads"),
             num_iters=bootstrap_cfg.get("num_iters"),
@@ -300,8 +314,8 @@ def main():
         max_epochs=config["training"]["max_epochs"],
         reload_dataloaders_every_n_epochs=1,
         callbacks=[
-            SelfPlayCallback(config=config, output_dir=run_dir),
-            ModelExportCallback(config=config),
+            SelfPlayCallback(config=config, output_dir=run_dir, obs_flat_size=obs_flat_size),
+            ModelExportCallback(config=config, obs_flat_size=obs_flat_size),
             LearningRateMonitor(logging_interval="step"),
             checkpoint_callback,
         ],

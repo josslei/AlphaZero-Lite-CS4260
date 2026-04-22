@@ -59,6 +59,10 @@ class ConnectFourCNN(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Handle flat input (B, 126) by reshaping to (B, 3, 6, 7)
+        if x.dim() == 2:
+            x = x.view(-1, 3, 6, 7)
+
         # Shape: (B, 3, 6, 7)
         x = self.in_conv(x)
         x = self.res1(x)

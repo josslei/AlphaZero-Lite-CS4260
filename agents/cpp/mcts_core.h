@@ -54,7 +54,7 @@ struct EvalRequest {
 class BatchEvaluator
 {
 public:
-    BatchEvaluator(const std::string &model_path, int batch_size, std::shared_ptr<PerfMetrics> metrics);
+    BatchEvaluator(const std::string &model_path, int batch_size, int obs_flat_size, std::shared_ptr<PerfMetrics> metrics);
     ~BatchEvaluator();
 
     EvaluatorResult evaluate(const torch::Tensor &state);
@@ -63,6 +63,7 @@ public:
 private:
     torch::jit::script::Module model;
     int batch_size;
+    int obs_flat_size;
     bool stop_flag = false;
 
     std::mutex m_mutex;
@@ -96,7 +97,7 @@ struct StepRecord {
 class SelfPlayEngine
 {
 public:
-    SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon);
+    SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon);
     ~SelfPlayEngine();
 
     py::list generate_games(int num_games, const std::string& game_name);
@@ -110,6 +111,7 @@ private:
 
     std::shared_ptr<BatchEvaluator> evaluator;
     std::shared_ptr<PerfMetrics> metrics;
+    int obs_flat_size;
     int num_threads;
     int num_iters;
     float temperature;

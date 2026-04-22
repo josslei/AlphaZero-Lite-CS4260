@@ -46,6 +46,15 @@ An interactive **Flet** (Python + Flutter) dashboard allows users to select game
 2.  **Modern UI:** Leveraging Flet for a responsive, desktop-class interactive experience.
 3.  **Visualization-First:** The UI allows for immediate qualitative analysis of agent behavior.
 
+### Observation Pipeline Convention
+
+The training and inference pipeline always passes **flat observation vectors** (as returned by open_spiel's `ObservationTensor()`) to the model. The **model network itself** is responsible for:
+
+1. **Reshaping** the flat input to its preferred format (e.g., `(B, 126) → (B, 3, 6, 7)` for the Connect Four CNN).
+2. **Normalization** of observation values, if needed by the game (e.g., for games with non-binary observation values).
+
+This convention ensures that both the C++ MCTS self-play engine and the Python inference code can feed raw flat observations to the TorchScript-traced model, and all transforms are handled transparently inside the model's `forward()` pass. Nothing outside the model needs to know about game-specific observation structure or value ranges.
+
 ## 🚦 Getting Started
 1. Install dependencies: `pip install -r requirements.txt`
 2. Run the UI: `python3 ui/app.py`

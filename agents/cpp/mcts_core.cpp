@@ -14,8 +14,8 @@ thread_local std::mt19937 rng(std::random_device{}());
 std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
 // ---------- BatchEvaluator ----------
-BatchEvaluator::BatchEvaluator(const std::string &model_path, int batch_size, std::shared_ptr<PerfMetrics> metrics)
-    : batch_size(batch_size), metrics(metrics)
+BatchEvaluator::BatchEvaluator(const std::string &model_path, int batch_size, int obs_flat_size, std::shared_ptr<PerfMetrics> metrics)
+    : batch_size(batch_size), obs_flat_size(obs_flat_size), metrics(metrics)
 {
     // Enable CuDNN Benchmark to accelerate fixed-size CNN inference
     at::globalContext().setBenchmarkCuDNN(true);
@@ -80,7 +80,7 @@ void BatchEvaluator::run_inference()
     // JIT & CuDNN Warmup
     try {
         torch::NoGradGuard no_grad;
-        auto dummy_input = torch::zeros({batch_size, 3, 6, 7}).to(device);
+        auto dummy_input = torch::zeros({batch_size, obs_flat_size}).to(device);
         model.forward({dummy_input});
         if (device.is_cuda()) {
             torch::cuda::synchronize();
@@ -124,7 +124,7 @@ void BatchEvaluator::run_inference()
         auto cat_start = std::chrono::high_resolution_clock::now();
         torch::Tensor input;
         if (current_batch_size < batch_size) {
-            auto padding = torch::zeros({batch_size - current_batch_size, 3, 6, 7});
+            auto padding = torch::zeros({batch_size - current_batch_size, obs_flat_size});
             batch_tensors.push_back(padding);
             input = torch::cat(batch_tensors, 0).to(device);
         } else {
@@ -174,11 +174,11 @@ void BatchEvaluator::run_inference()
 }
 
 // ---------- SelfPlayEngine ----------
-SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon)
-    : num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), dirichlet_alpha(dirichlet_alpha), dirichlet_epsilon(dirichlet_epsilon)
+SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon)
+    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), dirichlet_alpha(dirichlet_alpha), dirichlet_epsilon(dirichlet_epsilon)
 {
     metrics = std::make_shared<PerfMetrics>();
-    evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, metrics);
+    evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, obs_flat_size, metrics);
 }
 
 SelfPlayEngine::~SelfPlayEngine() {}
@@ -291,7 +291,7 @@ void SelfPlayEngine::run_mcts(Node *root, const open_spiel::State& current_state
         else
         {
             std::vector<float> obs_vec = cur_state->ObservationTensor();
-            torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, 3, 6, 7}, torch::kFloat).clone();
+            torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, obs_flat_size}, torch::kFloat).clone();
             EvaluatorResult res = evaluator->evaluate(obs);
             expand_node(cur_node, *cur_state, res.policy);
             value = res.value;
@@ -314,7 +314,7 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
     {
         if (!root->is_expanded) {
             std::vector<float> obs_vec = state->ObservationTensor();
-            torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, 3, 6, 7}, torch::kFloat).clone();
+            torch::Tensor obs = torch::from_blob(obs_vec.data(), {1, obs_flat_size}, torch::kFloat).clone();
             EvaluatorResult res = evaluator->evaluate(obs);
             
             // Standard expansion
@@ -468,7 +468,7 @@ py::list SelfPlayEngine::generate_games(int num_games, const std::string& game_n
     for (const auto& traj : all_trajectories) {
         py::list py_traj;
         for (const auto& step : traj) {
-            py::array_t<float> py_obs({3, 6, 7});
+            py::array_t<float> py_obs({obs_flat_size});
             py::array_t<float> py_pi({static_cast<int>(std::get<1>(step).size())});
             std::memcpy(py_obs.mutable_data(), std::get<0>(step).data(), std::get<0>(step).size() * sizeof(float));
             std::memcpy(py_pi.mutable_data(), std::get<1>(step).data(), std::get<1>(step).size() * sizeof(float));

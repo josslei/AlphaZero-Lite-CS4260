@@ -39,8 +39,9 @@ class PyspielStateWrapper(State[int]):
 
 
 class AlphaZeroEvaluator:
-    def __init__(self, model_path: str, device: torch.device = default_device):
+    def __init__(self, model_path: str, obs_flat_size: int, device: torch.device = default_device):
         self.device = torch.device(device)
+        self.obs_flat_size = obs_flat_size
         try:
             # Try loading as a traced model first (as exported by train.py)
             self.model = torch.jit.load(model_path, map_location=self.device)
@@ -55,9 +56,13 @@ class AlphaZeroEvaluator:
         state = state_wrapper.state
 
         # 1. Convert to observation tensor
-        # pyspiel.State.observation_tensor() for connect_four returns (3, 6, 7) flat list
+        # Every game now feeds a flat observation tensor to the model.
+        # The model network (if traced correctly) reshapes it internally,
+        # but for consistency we feed (1, obs_flat_size).
         obs = state.observation_tensor()
-        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).view(1, 3, 6, 7)
+        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).view(
+            1, self.obs_flat_size
+        )
 
         # 2. Model Inference
         with torch.no_grad():
