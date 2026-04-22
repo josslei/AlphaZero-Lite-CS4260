@@ -37,14 +37,13 @@ BatchEvaluator::BatchEvaluator(const std::string &model_path, int batch_size, in
         std::cerr << "Error loading model from " << model_path << ": " << e.what() << "\n";
     }
 
-    // Pre-allocate the CPU pinned-memory batch buffer
+    // Pre-allocate the CPU batch buffer (pinned memory for fast DMA on CUDA)
     auto dtype = use_fp16 ? torch::kFloat16 : torch::kFloat32;
     if (device.is_cuda()) {
         batch_buffer = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(dtype).pinned_memory(true));
     } else {
         batch_buffer = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(dtype));
     }
-    slot_promises.resize(batch_size);
 
     std::cout << "[C++] Pre-allocated batch buffer: [" << batch_size << ", " << obs_flat_size << "] "
               << (use_fp16 ? "FP16" : "FP32")
@@ -71,36 +70,12 @@ EvaluatorResult BatchEvaluator::evaluate(const float* obs_data)
     auto start = std::chrono::high_resolution_clock::now();
     std::future<EvaluatorResult> future;
     {
-        std::unique_lock<std::mutex> lock(m_mutex);
-
-        // Wait if all slots are full (inference thread hasn't consumed them yet)
-        cv_slot.wait(lock, [this] { return next_slot < batch_size || stop_flag; });
-        if (stop_flag) {
-            return EvaluatorResult();
-        }
-
-        int slot = next_slot++;
-
-        // Copy observation data directly into the pre-allocated buffer row
-        if (use_fp16) {
-            // Convert float32 input to float16 and write into the buffer
-            auto accessor = batch_buffer.accessor<at::Half, 2>();
-            for (int j = 0; j < obs_flat_size; ++j) {
-                accessor[slot][j] = static_cast<at::Half>(obs_data[j]);
-            }
-        } else {
-            float* dest = batch_buffer.data_ptr<float>() + slot * obs_flat_size;
-            std::memcpy(dest, obs_data, obs_flat_size * sizeof(float));
-        }
-
+        std::lock_guard<std::mutex> lock(m_mutex);
         std::promise<EvaluatorResult> promise;
         future = promise.get_future();
-        slot_promises[slot] = std::move(promise);
-
-        int trigger_threshold = std::max(1, (int)(batch_size * 0.8));
-        if (next_slot >= trigger_threshold) {
-            cv_batch.notify_one();
-        }
+        // Push a cheap vector copy (~500 bytes) — no torch::Tensor allocation, no blocking
+        queue.push({std::vector<float>(obs_data, obs_data + obs_flat_size), std::move(promise)});
+        cv_batch.notify_one();
     }
     auto result = future.get();
     auto end = std::chrono::high_resolution_clock::now();
@@ -130,38 +105,44 @@ void BatchEvaluator::run_inference()
 
         auto wait_start = std::chrono::high_resolution_clock::now();
         cv_batch.wait_for(lock, std::chrono::milliseconds(2), [this, trigger_threshold]
-                          { return next_slot >= trigger_threshold || stop_flag; });
+                          { return (int)queue.size() >= trigger_threshold || stop_flag; });
         auto wait_end = std::chrono::high_resolution_clock::now();
         metrics->wait_time_us += std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_start).count();
 
-        if (stop_flag && next_slot == 0)
+        if (stop_flag && queue.empty())
             break;
 
-        if (next_slot == 0)
+        if (queue.empty())
             continue;
 
-        int current_batch_size = next_slot;
+        int current_batch_size = std::min((int)queue.size(), batch_size);
 
-        // Collect promises for this batch
-        std::vector<std::promise<EvaluatorResult>> batch_promises(current_batch_size);
-        for (int i = 0; i < current_batch_size; ++i) {
-            batch_promises[i] = std::move(slot_promises[i]);
-        }
-
-        // Reset slot counter so new requests can start filling
-        next_slot = 0;
-        lock.unlock();
-        cv_slot.notify_all();  // Wake up any threads waiting for slots
-
-        // Prepare input: slice the pre-allocated buffer (zero-copy view) and transfer to device
+        // Drain queue into pre-allocated buffer via memcpy (no torch::cat needed)
         auto cat_start = std::chrono::high_resolution_clock::now();
-        torch::Tensor input;
-        if (current_batch_size < batch_size) {
-            // Pad to fixed batch size for consistent CuDNN performance
-            input = batch_buffer.to(device, /*non_blocking=*/true);
-        } else {
-            input = batch_buffer.to(device, /*non_blocking=*/true);
+        std::vector<std::promise<EvaluatorResult>> batch_promises;
+        batch_promises.reserve(current_batch_size);
+
+        for (int i = 0; i < current_batch_size; ++i)
+        {
+            auto req = std::move(queue.front());
+            queue.pop();
+
+            if (use_fp16) {
+                auto accessor = batch_buffer.accessor<at::Half, 2>();
+                for (int j = 0; j < obs_flat_size; ++j) {
+                    accessor[i][j] = static_cast<at::Half>(req.obs[j]);
+                }
+            } else {
+                float* dest = batch_buffer.data_ptr<float>() + i * obs_flat_size;
+                std::memcpy(dest, req.obs.data(), obs_flat_size * sizeof(float));
+            }
+
+            batch_promises.push_back(std::move(req.promise));
         }
+        lock.unlock();
+
+        // Transfer buffer to device (single contiguous copy, no torch::cat)
+        torch::Tensor input = batch_buffer.to(device);
         auto cat_end = std::chrono::high_resolution_clock::now();
         metrics->cat_time_us += std::chrono::duration_cast<std::chrono::microseconds>(cat_end - cat_start).count();
 
@@ -174,9 +155,14 @@ void BatchEvaluator::run_inference()
             metrics->forward_time_us += std::chrono::duration_cast<std::chrono::microseconds>(f_end - f_start).count();
 
             auto p_start = std::chrono::high_resolution_clock::now();
-            // Always cast output to FP32 for CPU-side parsing
-            torch::Tensor policy_tensor = output->elements()[0].toTensor().to(torch::kCPU).to(torch::kFloat32).contiguous();
-            torch::Tensor value_tensor = output->elements()[1].toTensor().to(torch::kCPU).to(torch::kFloat32).contiguous();
+            torch::Tensor policy_tensor = output->elements()[0].toTensor().to(torch::kCPU);
+            torch::Tensor value_tensor = output->elements()[1].toTensor().to(torch::kCPU);
+            if (use_fp16) {
+                policy_tensor = policy_tensor.to(torch::kFloat32);
+                value_tensor = value_tensor.to(torch::kFloat32);
+            }
+            policy_tensor = policy_tensor.contiguous();
+            value_tensor = value_tensor.contiguous();
 
             float* policy_ptr = policy_tensor.data_ptr<float>();
             float* value_ptr = value_tensor.data_ptr<float>();
@@ -185,12 +171,13 @@ void BatchEvaluator::run_inference()
             for (int i = 0; i < current_batch_size; ++i)
             {
                 EvaluatorResult res;
+                res.policy.reserve(num_actions);
                 res.value = value_ptr[i];
                 for (int a = 0; a < num_actions; ++a)
                 {
                     res.policy[a] = policy_ptr[i * num_actions + a];
                 }
-                batch_promises[i].set_value(res);
+                batch_promises[i].set_value(std::move(res));
             }
             auto p_end = std::chrono::high_resolution_clock::now();
             metrics->parse_time_us += std::chrono::duration_cast<std::chrono::microseconds>(p_end - p_start).count();

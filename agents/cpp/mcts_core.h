@@ -47,7 +47,7 @@ struct EvaluatorResult
 };
 
 struct EvalRequest {
-    int slot_index;                   // Index into the pre-allocated batch buffer
+    std::vector<float> obs;           // Owned copy of observation data (cheap: ~500 bytes)
     std::promise<EvaluatorResult> promise;
 };
 
@@ -68,15 +68,13 @@ private:
     bool stop_flag = false;
     torch::Device device{torch::kCPU};
 
-    // Pre-allocated batch buffer (CPU pinned memory) and slot tracking
-    torch::Tensor batch_buffer;                           // [batch_size, obs_flat_size] pinned CPU
-    std::vector<std::promise<EvaluatorResult>> slot_promises;
-    int next_slot = 0;
+    // Pre-allocated batch buffer filled by inference thread from queue
+    torch::Tensor batch_buffer;       // [batch_size, obs_flat_size] pinned CPU
 
     std::mutex m_mutex;
     std::condition_variable cv_batch;
-    std::condition_variable cv_slot;  // Notify when slots are available after inference
 
+    std::queue<EvalRequest> queue;    // Unbounded queue — workers never block on submission
     std::thread worker_thread;
     std::shared_ptr<PerfMetrics> metrics;
 };
