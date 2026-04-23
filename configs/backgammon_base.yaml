@@ -1,0 +1,53 @@
+# Experiment: Backgammon Base
+game:
+  name: "backgammon"
+  params: {}
+
+model:
+  architecture: "BackgammonCNN"
+  params:
+    return_logits: true
+
+mcts:
+  # Search parameters
+  num_threads: 256
+  batch_size: 64
+  temperature: 1.0
+  c_puct: 1.0
+
+  # Dirichlet Noise tailored for backgammon branching factor
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+
+  # Iteration Schedule: [start_epoch, num_iters]
+  schedule:
+    - [ 0, 100 ]
+    - [ 5, 400 ]
+    - [ 20, 800 ]
+
+  # Workload parameters
+  num_games_per_epoch: 256
+
+  # In-place ApplyAction/UndoAction (backgammon natively supports it perfectly for open loop states)
+  use_undo: false
+
+  bootstrap:
+    enabled: true
+    num_games: 64
+    num_threads: 64
+    num_iters: 100
+    batch_size: 32
+
+training:
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 64
+  max_epochs: 50
+  replay_buffer_size: 500000
+  num_workers: 4
+
+system:
+  accelerator: "auto"
+  devices: 1
+  precision: "medium"
+  use_fp16: false

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ResidualBlockCNN(nn.Module):
+class ResidualBlockCNN2D(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
 
@@ -32,9 +32,9 @@ class ConnectFourCNN(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(),
         )
-        self.res1 = ResidualBlockCNN(128)
-        self.res2 = ResidualBlockCNN(128)
-        self.res3 = ResidualBlockCNN(128)
+        self.res1 = ResidualBlockCNN2D(128)
+        self.res2 = ResidualBlockCNN2D(128)
+        self.res3 = ResidualBlockCNN2D(128)
 
         policy_layers = [
             nn.Conv2d(128, 2, kernel_size=3, stride=1, padding="same", bias=False),

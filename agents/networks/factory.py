@@ -1,7 +1,9 @@
 from .connect_four import ConnectFourCNN
+from .backgammon import BackgammonCNN
 
 MODEL_REGISTRY = {
     "ConnectFourCNN": ConnectFourCNN,
+    "BackgammonCNN": BackgammonCNN,
 }
 
 

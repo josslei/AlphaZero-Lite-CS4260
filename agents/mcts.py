@@ -51,6 +51,9 @@ class MCTS[S: State, A]:
         self.temperature = temperature
 
     def search(self, s_init: S):
+        # We must align the root state past any initial environment chance mechanisms
+        self.advance_chance_nodes(s_init)
+
         root = Node[A](parent=None, prior_prob=1.0)
         root.visit_count = 1
 
@@ -64,8 +67,12 @@ class MCTS[S: State, A]:
 
             # Step 1: Selection
             while cur_node.is_expanded and (not cur_state.is_terminal()):
-                best_action, next_node = self.select_best_child(cur_node, self.select_fn)
+                legal_actions = cur_state.legal_actions()
+                best_action, next_node = self.select_best_child(
+                    cur_node, self.select_fn, legal_actions
+                )
                 cur_state.apply_action(best_action)
+                self.advance_chance_nodes(cur_state)
                 cur_node = next_node
 
             # Step 2: Expansion & Evaluation
@@ -80,15 +87,45 @@ class MCTS[S: State, A]:
             self.backpropagate(cur_node, value)
 
         # Step 4: Policy Generation
-        return self.calculate_action_probabilities(root)
+        return self.calculate_action_probabilities(root, s_init.legal_actions())
+
+    def advance_chance_nodes(self, state: S) -> None:
+        while state.is_chance_node() and not state.is_terminal():
+            outcomes = state.chance_outcomes()
+            actions = [outcome[0] for outcome in outcomes]
+            probs = [outcome[1] for outcome in outcomes]
+
+            # Normalize probabilities to avoid numpy rounding check errors
+            probs_arr = np.array(probs, dtype=np.float64)
+            probs_arr /= np.sum(probs_arr)
+
+            sampled_action = np.random.choice(actions, p=probs_arr)
+            state.apply_action(sampled_action)
 
     def select_best_child(
-        self, node: Node[A], score_function: Callable[[Node, int], float]
+        self, node: Node[A], score_function: Callable[[Node, int], float], legal_actions: list[A]
     ) -> tuple[A, Node[A]]:
-        assert node.children, f"Node {node} is marked as expanded but has no children!"
-        best_action, best_child = max(
-            node.children.items(), key=lambda item: score_function(item[1], node.visit_count)
-        )
+        best_action = None
+        best_child = None
+        best_score = -float("inf")
+
+        for action in legal_actions:
+            if action not in node.children:
+                # Lazy instantiation for open-loop paths not encountered during initial expansion
+                node.children[action] = Node(
+                    parent=node, prior_prob=1.0 / max(1, len(legal_actions))
+                )
+
+            child = node.children[action]
+            score = score_function(child, node.visit_count)
+            if score > best_score:
+                best_score = score
+                best_action = action
+                best_child = child
+
+        assert (
+            best_action is not None and best_child is not None
+        ), "No valid action found in legal_actions."
         return best_action, best_child
 
     def expand_node(self, node: Node[A], state: S, policy: PPD[A]) -> None:
@@ -108,27 +145,46 @@ class MCTS[S: State, A]:
             cur_node = cur_node.parent
             value = -value
 
-    def calculate_action_probabilities(self, root: Node[A]) -> Mapping[A, float]:
+    def calculate_action_probabilities(
+        self, root: Node[A], legal_actions: list[A]
+    ) -> list[tuple[A, float]]:
         if not root.children:
-            return {}
+            return []
 
+        legal_set = set(legal_actions)
         if self.temperature <= 1e-3:
-            max_visits = max(child.visit_count for child in root.children.values())
-            best_actions = [a for a, c in root.children.items() if c.visit_count == max_visits]
-            best_action = random.choice(best_actions)
-            return {action: (1.0 if action == best_action else 0.0) for action in root.children}
+            # Deterministic max visit
+            best_action: A | None = None
+            max_visits = -1
+            for action, child in root.children.items():
+                if action not in legal_set:
+                    continue
+                if child.visit_count > max_visits:
+                    max_visits = child.visit_count
+                    best_action = action
 
-        actions = list(root.children.keys())
-        visits = np.array([child.visit_count for child in root.children.values()], dtype=np.float64)
-        weights = visits ** (1.0 / self.temperature)
-        total_weight = np.sum(weights)
+            if best_action is not None:
+                return [(best_action, 1.0)]
+            return []
 
-        if total_weight == 0:
-            probs = np.ones_like(visits) / len(visits)
+        # Temperature scaling
+        weights: list[float] = []
+        actions: list[A] = []
+        for action, child in root.children.items():
+            if action not in legal_set:
+                continue
+            weights.append(child.visit_count ** (1.0 / self.temperature))
+            from typing import cast
+
+            actions.append(cast(A, action))
+
+        total_weight = sum(weights)
+        if total_weight > 0:
+            probs = [w / total_weight for w in weights]
         else:
-            probs = weights / total_weight
+            probs = [1.0 / len(actions)] * len(actions) if actions else []
 
-        return dict(zip(actions, probs))
+        return list(zip(actions, probs))
 
 
 class SelfPlayEngine:

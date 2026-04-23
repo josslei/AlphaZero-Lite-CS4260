@@ -219,7 +219,7 @@ void SelfPlayEngine::expand_node(Node *node, const open_spiel::State& state, con
     node->is_expanded = true;
 }
 
-std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *node)
+std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions)
 {
     open_spiel::Action best_action = -1;
     Node *best_child = nullptr;
@@ -227,10 +227,13 @@ std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *no
 
     float sqrt_parent_visits = std::sqrt(std::max(1.0f, (float)node->visit_count));
 
-    for (auto &pair : node->children)
+    for (open_spiel::Action action : legal_actions)
     {
-        open_spiel::Action action = pair.first;
-        Node *child = pair.second.get();
+        if (!node->children.count(action)) {
+            node->children[action] = std::make_unique<Node>(node, 1.0f / std::max(1, (int)legal_actions.size()));
+        }
+
+        Node *child = node->children[action].get();
 
         float q_value = child->visit_count > 0 ? -child->mean_value : 0.0f;
         float u_value = c_puct * child->prior_prob * sqrt_parent_visits / (1.0f + child->visit_count);
@@ -258,6 +261,29 @@ void SelfPlayEngine::backpropagate(Node *node, float value)
 
         cur = cur->parent;
         value = -value;
+    }
+}
+
+void SelfPlayEngine::advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path)
+{
+    while (state->IsChanceNode() && !state->IsTerminal()) {
+        auto outcomes = state->ChanceOutcomes();
+        
+        float r = dist(rng);
+        float cumulative = 0.0f;
+        open_spiel::Action sampled_action = outcomes[0].first;
+        for (auto& outcome : outcomes) {
+            cumulative += outcome.second;
+            if (r <= cumulative) {
+                sampled_action = outcome.first;
+                break;
+            }
+        }
+        
+        if (action_path) {
+            action_path->push_back({state->CurrentPlayer(), sampled_action});
+        }
+        state->ApplyAction(sampled_action);
     }
 }
 
@@ -302,13 +328,15 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             // Selection
             while (cur_node->is_expanded)
             {
+                advance_chance_nodes(sim_state.get(), &action_path);
                 if (sim_state->IsTerminal()) break;
                 last_player = sim_state->CurrentPlayer();
-                auto best = select_best_child(cur_node);
+                auto best = select_best_child(cur_node, sim_state->LegalActions());
                 sim_state->ApplyAction(best.first);
                 action_path.push_back({last_player, best.first});
                 cur_node = best.second;
             }
+            advance_chance_nodes(sim_state.get(), &action_path);
 
             // Evaluation & Expansion
             float value = 0.0f;
@@ -340,12 +368,14 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             // Selection
             while (cur_node->is_expanded)
             {
+                advance_chance_nodes(cur_state.get(), nullptr);
                 if (cur_state->IsTerminal()) break;
                 last_player = cur_state->CurrentPlayer();
-                auto best = select_best_child(cur_node);
+                auto best = select_best_child(cur_node, cur_state->LegalActions());
                 cur_state->ApplyAction(best.first);
                 cur_node = best.second;
             }
+            advance_chance_nodes(cur_state.get(), nullptr);
 
             // Evaluation & Expansion
             float value = 0.0f;
@@ -375,6 +405,9 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
 
     std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame(game_name);
     std::unique_ptr<open_spiel::State> state = game->NewInitialState();
+    
+    advance_chance_nodes(state.get(), nullptr);
+    
     std::unique_ptr<Node> root = std::make_unique<Node>(nullptr, 1.0f);
     std::vector<StepRecord> trajectory;
 
@@ -414,11 +447,15 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
         int num_actions = game->NumDistinctActions();
         std::vector<float> pi(num_actions, 0.0f);
         open_spiel::Action best_action = -1;
+        
+        std::vector<open_spiel::Action> current_legal_actions = state->LegalActions();
+        absl::flat_hash_set<open_spiel::Action> legal_set(current_legal_actions.begin(), current_legal_actions.end());
 
         if (temperature <= 1e-3f)
         {
             int max_visits = -1;
             for (auto &pair : root->children) {
+                if (!legal_set.count(pair.first)) continue;
                 if (pair.second->visit_count > max_visits) {
                     max_visits = pair.second->visit_count;
                     best_action = pair.first;
@@ -431,6 +468,7 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
             float sum = 0.0f;
             absl::flat_hash_map<open_spiel::Action, float> weights;
             for (auto &pair : root->children) {
+                if (!legal_set.count(pair.first)) continue;
                 float w = std::pow(pair.second->visit_count, 1.0f / temperature);
                 weights[pair.first] = w;
                 sum += w;
@@ -446,6 +484,11 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
             }
             if (best_action == -1 && !weights.empty()) best_action = weights.begin()->first;
         }
+        
+        if (best_action == -1 && !current_legal_actions.empty()) {
+            best_action = current_legal_actions[0]; // fallback safely
+            pi[best_action] = 1.0f;
+        }
 
         StepRecord step;
         step.obs = state->ObservationTensor();
@@ -454,6 +497,7 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
         trajectory.push_back(step);
 
         state->ApplyAction(best_action);
+        advance_chance_nodes(state.get(), nullptr);
 
         if (root->children.count(best_action)) {
             std::unique_ptr<Node> next_root = std::move(root->children[best_action]);

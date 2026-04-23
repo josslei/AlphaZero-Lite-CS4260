@@ -1,5 +1,9 @@
 from abc import ABC, abstractmethod
 import numpy as np
+from agents.utils import (
+    OPENSPIEL_BACKGAMMON_ACTION_SPACE_SIZE,
+    OPENSPIEL_BACKGAMMON_OBSERVATION_SIZE,
+)
 
 
 class GameSpec(ABC):
@@ -45,8 +49,27 @@ class ConnectFourSpec(GameSpec):
         return [(flipped, np.flip(pi).copy())]
 
 
+class BackgammonSpec(GameSpec):
+    @property
+    def game_name(self) -> str:
+        return "backgammon"
+
+    @property
+    def obs_flat_size(self) -> int:
+        return OPENSPIEL_BACKGAMMON_OBSERVATION_SIZE
+
+    @property
+    def num_actions(self) -> int:
+        return OPENSPIEL_BACKGAMMON_ACTION_SPACE_SIZE
+
+    def augment(self, state: np.ndarray, pi: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+        return []
+
+
 def get_game_spec(name: str) -> GameSpec:
     if name == "connect_four":
         return ConnectFourSpec()
+    elif name == "backgammon":
+        return BackgammonSpec()
     else:
         raise ValueError(f"Unsupported game: {name}")
