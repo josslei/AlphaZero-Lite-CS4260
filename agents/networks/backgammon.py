@@ -31,17 +31,14 @@ class BackgammonCNN(nn.Module):
     def __init__(self, return_logits: bool = False, **kwargs) -> None:
         super().__init__()
 
+        board_feature_dim = 4 * 24
         self.board_in = nn.Sequential(
-            nn.Conv1d(in_channels=8, out_channels=64, kernel_size=3, padding="same", bias=False),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-        )
-        self.board_conv_block_1 = nn.Sequential(
-            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding="same", bias=False),
+            nn.Conv1d(in_channels=8, out_channels=128, kernel_size=3, padding="same", bias=False),
             nn.BatchNorm1d(128),
             nn.ReLU(),
         )
-        # board_feature dim: (batch_size, 4 * 24)
+        self.board_conv_block_1 = ResidualBlockCNN1D(128)
+        self.board_conv_block_2 = ResidualBlockCNN1D(128)
         self.board_out = nn.Sequential(
             nn.Conv1d(
                 in_channels=128, out_channels=4, kernel_size=3, stride=1, padding="same", bias=False
@@ -52,9 +49,10 @@ class BackgammonCNN(nn.Module):
         )
 
         # Global: stats and dice input
-        self.global_in = nn.Sequential(nn.Linear(20, 64), nn.ReLU())
+        global_feature_dim = 64
+        self.global_in = nn.Sequential(nn.Linear(20, 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU())
 
-        combined_feature_dim = 4 * 24 + 64
+        combined_feature_dim = board_feature_dim + global_feature_dim
 
         policy_out_dim = OPENSPIEL_BACKGAMMON_ACTION_SPACE_SIZE
         policy_layers = [
@@ -80,6 +78,7 @@ class BackgammonCNN(nn.Module):
         # Feature - board (batch_size, 96)
         feat_board = self.board_in(board_state)
         feat_board = self.board_conv_block_1(feat_board)
+        feat_board = self.board_conv_block_2(feat_board)
         feat_board = self.board_out(feat_board)
         # Feature - global (batch_size, 64)
         feat_global = self.global_in(torch.cat((stats, dice_flat), dim=1))
