@@ -42,7 +42,7 @@ struct PerfMetrics {
 
 struct EvaluatorResult
 {
-    absl::flat_hash_map<open_spiel::Action, float> policy;
+    std::vector<float> policy;
     float value;
 };
 
@@ -111,7 +111,7 @@ private:
     void play_game(const std::string& game_name, std::vector<std::vector<std::tuple<std::vector<float>, std::vector<float>, float>>>& all_trajectories, std::mutex& traj_mutex);
     void run_mcts(Node *root, open_spiel::State& current_state);
     std::pair<open_spiel::Action, Node *> select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions);
-    void expand_node(Node *node, const open_spiel::State& state, const absl::flat_hash_map<open_spiel::Action, float> &policy);
+    void expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy);
     void backpropagate(Node *node, float value);
     void advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path = nullptr);
 

@@ -171,12 +171,8 @@ void BatchEvaluator::run_inference()
             for (int i = 0; i < current_batch_size; ++i)
             {
                 EvaluatorResult res;
-                res.policy.reserve(num_actions);
+                res.policy.assign(policy_ptr + i * num_actions, policy_ptr + (i + 1) * num_actions);
                 res.value = value_ptr[i];
-                for (int a = 0; a < num_actions; ++a)
-                {
-                    res.policy[a] = policy_ptr[i * num_actions + a];
-                }
                 batch_promises[i].set_value(std::move(res));
             }
             auto p_end = std::chrono::high_resolution_clock::now();
@@ -203,7 +199,7 @@ SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, in
 
 SelfPlayEngine::~SelfPlayEngine() {}
 
-void SelfPlayEngine::expand_node(Node *node, const open_spiel::State& state, const absl::flat_hash_map<open_spiel::Action, float> &policy)
+void SelfPlayEngine::expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy)
 {
     if (node->is_expanded)
         return;
@@ -212,8 +208,8 @@ void SelfPlayEngine::expand_node(Node *node, const open_spiel::State& state, con
 
     for (open_spiel::Action action : legal_actions)
     {
-        auto it = policy.find(action);
-        float prob = (it != policy.end()) ? it->second : 0.0f;
+        // Safety check to ensure action is within vector bounds
+        float prob = (action >= 0 && action < static_cast<open_spiel::Action>(policy.size())) ? policy[action] : 0.0f;
         node->children[action] = std::make_unique<Node>(node, prob);
     }
     node->is_expanded = true;
