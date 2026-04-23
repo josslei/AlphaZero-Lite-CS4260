@@ -155,14 +155,20 @@ void BatchEvaluator::run_inference()
             metrics->forward_time_us += std::chrono::duration_cast<std::chrono::microseconds>(f_end - f_start).count();
 
             auto p_start = std::chrono::high_resolution_clock::now();
-            torch::Tensor policy_tensor = output->elements()[0].toTensor().to(torch::kCPU);
-            torch::Tensor value_tensor = output->elements()[1].toTensor().to(torch::kCPU);
-            if (use_fp16) {
+
+            // 1. Get tensors (data still resides on GPU at this point)
+            torch::Tensor policy_tensor = output->elements()[0].toTensor();
+            torch::Tensor value_tensor = output->elements()[1].toTensor();
+
+            // 2. Force FP16 to FP32 conversion on the GPU
+            if (use_fp16 && policy_tensor.scalar_type() == torch::kHalf) {
                 policy_tensor = policy_tensor.to(torch::kFloat32);
                 value_tensor = value_tensor.to(torch::kFloat32);
             }
-            policy_tensor = policy_tensor.contiguous();
-            value_tensor = value_tensor.contiguous();
+
+            // 3. Perform D2H memory transfer (transferring FP32 data)
+            policy_tensor = policy_tensor.to(torch::kCPU).contiguous();
+            value_tensor = value_tensor.to(torch::kCPU).contiguous();
 
             float* policy_ptr = policy_tensor.data_ptr<float>();
             float* value_ptr = value_tensor.data_ptr<float>();
@@ -171,8 +177,13 @@ void BatchEvaluator::run_inference()
             for (int i = 0; i < current_batch_size; ++i)
             {
                 EvaluatorResult res;
-                res.policy.assign(policy_ptr + i * num_actions, policy_ptr + (i + 1) * num_actions);
                 res.value = value_ptr[i];
+                
+                // 4. Allocate exact memory for the vector and use low-level block copy 
+                // instead of element-wise loop assignment
+                res.policy.resize(num_actions);
+                std::memcpy(res.policy.data(), policy_ptr + i * num_actions, num_actions * sizeof(float));
+                
                 batch_promises[i].set_value(std::move(res));
             }
             auto p_end = std::chrono::high_resolution_clock::now();

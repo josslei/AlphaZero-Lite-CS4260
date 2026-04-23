@@ -21,9 +21,9 @@ mcts:
 
   # Iteration Schedule: [start_epoch, num_iters]
   schedule:
-    - [ 0, 100 ]
-    - [ 5, 400 ]
-    - [ 20, 800 ]
+    - [ 0, 50 ]
+    - [ 5, 100 ]
+    - [ 20, 200 ]
 
   # Workload parameters
   num_games_per_epoch: 256
