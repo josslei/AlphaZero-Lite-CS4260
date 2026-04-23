@@ -17,4 +17,5 @@ def BackgammonView(page: ft.Page, p1_global: Any, p2_global: Any):
         p1_global=p1_global,
         p2_global=p2_global,
         agent_class=AlphaZeroAgent,
+        use_move_selector=True,
     )

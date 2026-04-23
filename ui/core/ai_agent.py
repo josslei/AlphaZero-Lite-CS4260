@@ -7,6 +7,7 @@ from typing import Any
 from agents.inference import PyspielStateWrapper, AlphaZeroEvaluator
 from agents.mcts import MCTS
 from agents.utils import select_alphazero, State, PPD
+from agents.game_spec import get_game_spec
 
 
 class Agent:
@@ -57,7 +58,8 @@ class AlphaZeroAgent(Agent):
             model_path = self._find_latest_model()
 
         if model_path and os.path.exists(model_path):
-            self.evaluator = AlphaZeroEvaluator(model_path)
+            spec = get_game_spec(self.game_name)
+            self.evaluator = AlphaZeroEvaluator(model_path, spec.obs_flat_size)
             self.mcts = MCTS(
                 select_fn=select_alphazero,
                 evaluate_fn=self.evaluator,

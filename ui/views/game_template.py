@@ -17,6 +17,7 @@ def CreateGameView(
     p1_global: Any,
     p2_global: Any,
     agent_class: Type[Any] = RandomPolicyAgent,
+    use_move_selector: bool = False,
 ):
     """
     A general factory for creating game views (Connect Four, Backgammon, etc.)
@@ -199,6 +200,7 @@ def CreateGameView(
                                         content=move_selector,
                                         width=200,  # Fixed width for the list
                                         expand=False,
+                                        visible=use_move_selector,
                                     ),
                                 ],
                                 expand=True,
