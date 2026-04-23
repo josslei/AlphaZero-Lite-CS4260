@@ -327,6 +327,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
         Node *cur_node = root;
         open_spiel::Player last_player = open_spiel::kInvalidPlayer;
+        int current_depth = 0;
 
         if (use_undo) {
             // Undo-based path: apply actions in-place, track path for reversal
@@ -335,6 +336,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             // Selection
             while (cur_node->is_expanded)
             {
+                current_depth++;
                 advance_chance_nodes(sim_state.get(), &action_path);
                 if (sim_state->IsTerminal()) break;
                 last_player = sim_state->CurrentPlayer();
@@ -375,6 +377,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             // Selection
             while (cur_node->is_expanded)
             {
+                current_depth++;
                 advance_chance_nodes(cur_state.get(), nullptr);
                 if (cur_state->IsTerminal()) break;
                 last_player = cur_state->CurrentPlayer();
@@ -403,6 +406,15 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
             backpropagate(cur_node, value);
         }
+
+        // Record statistics
+        metrics->total_search_depth += current_depth;
+        metrics->num_searches++;
+        
+        // Update maximum depth using atomic operations
+        int current_max = metrics->max_search_depth.load();
+        while (current_depth > current_max && 
+               !metrics->max_search_depth.compare_exchange_weak(current_max, current_depth)) {}
     }
 }
 
@@ -595,4 +607,13 @@ py::list SelfPlayEngine::generate_games(int num_games, const std::string& game_n
         py_all_trajectories.append(py_traj);
     }
     return py_all_trajectories;
+}
+
+py::dict SelfPlayEngine::get_metrics() {
+    py::dict d;
+    double avg_depth = metrics->num_searches > 0 ? 
+                       (double)metrics->total_search_depth / metrics->num_searches : 0.0;
+    d["avg_search_depth"] = avg_depth;
+    d["max_search_depth"] = (double)metrics->max_search_depth.load();
+    return d;
 }

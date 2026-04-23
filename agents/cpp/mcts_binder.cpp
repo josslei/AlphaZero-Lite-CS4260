@@ -19,5 +19,6 @@ PYBIND11_MODULE(mcts_backend, m) {
              py::arg("use_fp16") = false,
              py::arg("use_undo") = false)
         .def("generate_games", &SelfPlayEngine::generate_games, 
-             py::arg("num_games"), py::arg("game_name"));
+             py::arg("num_games"), py::arg("game_name"))
+        .def("get_metrics", &SelfPlayEngine::get_metrics);
 }

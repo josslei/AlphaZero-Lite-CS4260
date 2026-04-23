@@ -32,11 +32,16 @@ struct PerfMetrics {
     std::atomic<long long> mcts_eval_wait_time_us{0}; // Time spent waiting for NN results
     std::atomic<long long> iters_saved{0};            // Number of simulations skipped by early stopping
     
+    std::atomic<long long> total_search_depth{0};
+    std::atomic<long long> num_searches{0};
+    std::atomic<int> max_search_depth{0};
+    
     void reset() {
         wait_time_us = 0; cat_time_us = 0; forward_time_us = 0; parse_time_us = 0;
         total_batches = 0; total_requests = 0;
         mcts_search_time_us = 0; mcts_eval_wait_time_us = 0;
         iters_saved = 0;
+        total_search_depth = 0; num_searches = 0; max_search_depth = 0;
     }
 };
 
@@ -106,6 +111,7 @@ public:
     ~SelfPlayEngine();
 
     py::list generate_games(int num_games, const std::string& game_name);
+    py::dict get_metrics(); 
 
 private:
     void play_game(const std::string& game_name, std::vector<std::vector<std::tuple<std::vector<float>, std::vector<float>, float>>>& all_trajectories, std::mutex& traj_mutex);

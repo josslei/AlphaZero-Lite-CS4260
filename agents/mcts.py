@@ -223,3 +223,6 @@ class SelfPlayEngine:
 
     def generate_games(self, num_games: int, game_name: str = "connect_four"):
         return self.engine.generate_games(num_games, game_name)
+
+    def get_metrics(self):
+        return self.engine.get_metrics()

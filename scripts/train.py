@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import yaml
 import argparse
+import pyspiel
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
@@ -30,7 +31,7 @@ def execute_self_play(
     num_threads=None,
     num_iters=None,
     batch_size=None,
-) -> list[list[tuple[np.ndarray, np.ndarray, float]]]:
+) -> tuple[list[list[tuple[np.ndarray, np.ndarray, float]]], dict]:
     """
     Simulates self-play games using the Pure C++ SelfPlayEngine.
     Values are taken from config['mcts'] unless overridden.
@@ -65,13 +66,14 @@ def execute_self_play(
     )
 
     trajectories = engine.generate_games(num_games=num_games, game_name=game_name)
+    cpp_metrics = engine.get_metrics()
 
     # Explicitly cleanup engine to free C++/LibTorch GPU memory
     del engine
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return trajectories
+    return trajectories, cpp_metrics
 
 
 def resolve_num_iters(config, current_epoch: int) -> int:
@@ -115,7 +117,9 @@ class ModelExportCallback(Callback):
 
         use_fp16 = self.config["system"].get("use_fp16", False)
         input_dtype = torch.float16 if use_fp16 else torch.float32
-        example_input = torch.randn(1, self.obs_flat_size, device=pl_module.device, dtype=input_dtype)
+        example_input = torch.randn(
+            1, self.obs_flat_size, device=pl_module.device, dtype=input_dtype
+        )
 
         # Track valid .pt paths to keep
         valid_pt_paths = set()
@@ -208,7 +212,9 @@ class SelfPlayCallback(Callback):
             inference_model.half()
 
         input_dtype = torch.float16 if use_fp16 else torch.float32
-        example_input = torch.randn(1, self.obs_flat_size, device=az_module.device, dtype=input_dtype)
+        example_input = torch.randn(
+            1, self.obs_flat_size, device=az_module.device, dtype=input_dtype
+        )
 
         # Cast to ScriptModule to resolve .save() attribute error
         traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(inference_model, example_input))
@@ -216,16 +222,67 @@ class SelfPlayCallback(Callback):
         traced_model.save(export_path)
 
         # Invoke the C++ Self-Play engine using scheduled iters
-        new_data = execute_self_play(
+        new_data, cpp_metrics = execute_self_play(
             config=self.config,
             model_path=export_path,
             obs_flat_size=self.obs_flat_size,
             num_iters=num_iters,
         )
 
+        # 2. Log MCTS depth metrics returned from C++
+        pl_module.log(
+            "self_play/mcts_avg_depth",
+            cpp_metrics.get("avg_search_depth", 0.0),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        pl_module.log(
+            "self_play/mcts_max_depth",
+            cpp_metrics.get("max_search_depth", 0.0),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        # 3. Calculate and log average game length
+        if new_data:
+            avg_game_length = sum(len(traj) for traj in new_data) / len(new_data)
+            pl_module.log(
+                "self_play/avg_game_length", float(avg_game_length), on_epoch=True, sync_dist=True
+            )
+
         # Load the new data into the Replay Buffer
         for trajectory in new_data:
             az_module.replay_buffer.push(trajectory)
+
+        # 4. Log Buffer Size
+        pl_module.log(
+            "self_play/buffer_size",
+            float(len(az_module.replay_buffer)),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        # 5. Calculate Root Value of the initial board state (zero overhead)
+        game = pyspiel.load_game(self.config["game"]["name"])
+        init_state = game.new_initial_state()
+
+        # Advance past initial chance nodes (e.g. initial dice roll in backgammon)
+        while init_state.is_chance_node():
+            outcomes = init_state.chance_outcomes()
+            action, _ = outcomes[0]  # Deterministic enough for a root value sample
+            init_state.apply_action(action)
+
+        obs_tensor = torch.tensor(
+            init_state.observation_tensor(), dtype=torch.float32, device=az_module.device
+        ).unsqueeze(0)
+
+        if self.config["system"].get("use_fp16", False):
+            obs_tensor = obs_tensor.half()
+
+        with torch.no_grad():
+            _, value = inference_model(obs_tensor)  # Use the latest model
+
+        pl_module.log("self_play/init_root_value", value.item(), on_epoch=True, sync_dist=True)
 
         print(
             f"<<< [Epoch {trainer.current_epoch}] C++ MCTS Self-Play: END (Pool Size: {len(az_module.replay_buffer)})"
@@ -306,7 +363,7 @@ def main():
         traced_model.save(init_model_path)
 
         # Execute initial self-play games using bootstrap overrides
-        init_data = execute_self_play(
+        init_data, _ = execute_self_play(
             config=config,
             model_path=init_model_path,
             obs_flat_size=obs_flat_size,

@@ -41,7 +41,7 @@ mcts:
 training:
   learning_rate: 0.001
   weight_decay: 0.0001
-  batch_size: 64
+  batch_size: 128
   max_epochs: 50
   replay_buffer_size: 500000
   num_workers: 4
