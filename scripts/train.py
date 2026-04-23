@@ -332,10 +332,14 @@ def main():
         mode="min",
     )
 
+    use_fp16 = config["system"].get("use_fp16", False)
+    precision = "16-mixed" if use_fp16 and torch.cuda.is_available() else "32-true"
+
     trainer = pl.Trainer(
         default_root_dir=run_dir,
         max_epochs=config["training"]["max_epochs"],
         reload_dataloaders_every_n_epochs=1,
+        precision=precision,
         callbacks=[
             SelfPlayCallback(config=config, output_dir=run_dir, obs_flat_size=obs_flat_size),
             ModelExportCallback(config=config, obs_flat_size=obs_flat_size),

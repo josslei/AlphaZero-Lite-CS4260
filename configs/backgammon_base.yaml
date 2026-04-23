@@ -11,7 +11,7 @@ model:
 mcts:
   # Search parameters
   num_threads: 256
-  batch_size: 64
+  batch_size: 32
   temperature: 1.0
   c_puct: 1.0
 
@@ -29,14 +29,14 @@ mcts:
   num_games_per_epoch: 256
 
   # In-place ApplyAction/UndoAction (backgammon natively supports it perfectly for open loop states)
-  use_undo: false
+  use_undo: true
 
   bootstrap:
     enabled: true
-    num_games: 64
-    num_threads: 64
-    num_iters: 100
-    batch_size: 32
+    num_games: 32
+    num_threads: 32
+    num_iters: 10
+    batch_size: 16
 
 training:
   learning_rate: 0.001
@@ -50,4 +50,4 @@ system:
   accelerator: "auto"
   devices: 1
   precision: "medium"
-  use_fp16: false
+  use_fp16: true

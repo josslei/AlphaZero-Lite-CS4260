@@ -13,10 +13,10 @@ class ResidualBlockCNN1D(nn.Module):
 
         self.conv = nn.Sequential(
             nn.Conv1d(dim, dim, kernel_size=3, stride=1, padding="same", bias=False),
-            nn.BatchNorm2d(dim),
+            nn.BatchNorm1d(dim),
             nn.ReLU(),
             nn.Conv1d(dim, dim, kernel_size=3, stride=1, padding="same", bias=False),
-            nn.BatchNorm2d(dim),
+            nn.BatchNorm1d(dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -110,7 +110,7 @@ class BackgammonCNN(nn.Module):
         # Dice state to one-hot: (B, 2) -> (B, 2, 7) -> (B, 14)
         # Clamped to prevent F.one_hot from crashing on negative values provided by torch.randn during JIT tracing
         dice_int = dice_state.to(torch.int64).clamp(min=0, max=6)
-        dice_onehot = F.one_hot(dice_int, num_classes=7).float()
+        dice_onehot = F.one_hot(dice_int, num_classes=7).to(x.dtype)
         dice_flat = dice_onehot.view(x.shape[0], -1)
 
         return board_state, stats, dice_flat
