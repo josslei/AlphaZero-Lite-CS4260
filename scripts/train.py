@@ -297,7 +297,7 @@ class SelfPlayCallback(Callback):
 
 class TournamentCallback(Callback):
     """
-    Evaluates the current model against benchmark opponents (random, minimax, etc.) configured in yaml.
+    Evaluates the current model's performance against benchmark opponents (Random, Minimax, etc.) configured in the YAML.
     """
 
     def __init__(self, config, obs_flat_size):
@@ -379,11 +379,9 @@ class TournamentCallback(Callback):
 
         for opponent_cfg in self.opponents_cfg:
             opp_type = opponent_cfg.get("type", "unknown")
-            try:
-                opponent = create_agent(opponent_cfg)
-            except NotImplementedError as e:
-                print(f"[WARNING] Skipping opponent '{opp_type}': {e}")
-                continue
+            # If the opponent is of type 'alphazero', it will share the weights currently being trained.
+            # If the opponent is Random/Minimax, the evaluator parameter will be ignored.
+            opponent = create_agent(opponent_cfg, evaluator=evaluator)
 
             wins, losses, draws = 0, 0, 0
 

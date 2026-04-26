@@ -22,11 +22,13 @@ class Node[A]:
         parent: Self | None = None,
         children: MutableMapping[A, Self] | None = None,
         prior_prob: float = 1.0,
+        player_id: int = 0,
     ):
         # Tree node properties
         self.parent = parent
         self.children = children if children is not None else {}
         self.is_expanded = False
+        self.player_id = player_id
 
         # Statistics
         self.visit_count: int = 0  # (N) number of times this node was visited
@@ -54,7 +56,7 @@ class MCTS[S: State, A]:
         # We must align the root state past any initial environment chance mechanisms
         self.advance_chance_nodes(s_init)
 
-        root = Node[A](parent=None, prior_prob=1.0)
+        root = Node[A](parent=None, prior_prob=1.0, player_id=s_init.current_player())
         root.visit_count = 1
 
         # Expand root node using eval fn to get initial prior probs
@@ -71,17 +73,27 @@ class MCTS[S: State, A]:
                 best_action, next_node = self.select_best_child(
                     cur_node, self.select_fn, legal_actions
                 )
+                
+                cur_p = cur_state.current_player()
                 cur_state.apply_action(best_action)
                 self.advance_chance_nodes(cur_state)
                 cur_node = next_node
+                
+                if not cur_state.is_terminal():
+                    cur_node.player_id = cur_state.current_player()
+                else:
+                    cur_node.player_id = cur_p
 
             # Step 2: Expansion & Evaluation
             value = 0.0
             if cur_state.is_terminal():
-                value = cur_state.rewards()
+                if cur_node.player_id < 0:
+                    cur_node.player_id = cur_node.parent.player_id if cur_node.parent is not None else 0
+                value = cur_state.returns()[cur_node.player_id]
             else:
                 policy, value = self.evaluate_fn(cur_state)
                 self.expand_node(cur_node, cur_state, policy)
+                cur_node.player_id = cur_state.current_player()
 
             # Step 3: Backpropagation
             self.backpropagate(cur_node, value)
@@ -142,8 +154,11 @@ class MCTS[S: State, A]:
             cur_node.visit_count += 1
             cur_node.total_value += value
             cur_node.mean_value = cur_node.total_value / cur_node.visit_count
+            
+            if cur_node.parent is not None and cur_node.parent.player_id != cur_node.player_id:
+                value = -value
+                
             cur_node = cur_node.parent
-            value = -value
 
     def calculate_action_probabilities(
         self, root: Node[A], legal_actions: list[A]

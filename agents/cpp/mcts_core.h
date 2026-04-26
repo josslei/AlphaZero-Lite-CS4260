@@ -89,6 +89,7 @@ struct Node
     Node *parent;
     absl::flat_hash_map<open_spiel::Action, std::unique_ptr<Node>> children;
     bool is_expanded = false;
+    open_spiel::Player player_id = 0;
 
     int visit_count = 0;
     float total_value = 0.0f;

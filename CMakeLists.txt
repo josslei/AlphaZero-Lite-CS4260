@@ -69,9 +69,9 @@ if(APPLE)
     # On macOS, we can use -Wl,-hidden-l to hide linked library symbols, 
     # but since we are using OBJECT libraries, they are already part of our translation unit.
     # We just need to make sure they are not exported.
-    target_compile_options(mcts_backend PRIVATE -fvisibility=hidden)
+    target_compile_options(mcts_backend PRIVATE -fvisibility=hidden -O3)
 else()
-    target_compile_options(mcts_backend PRIVATE -fvisibility=hidden)
+    target_compile_options(mcts_backend PRIVATE -fvisibility=hidden -O3)
 endif()
 
 target_include_directories(mcts_backend PRIVATE 

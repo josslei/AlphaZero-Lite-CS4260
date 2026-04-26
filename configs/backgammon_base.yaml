@@ -21,7 +21,7 @@ mcts:
 
   # Iteration Schedule: [start_epoch, num_iters]
   schedule:
-    - [ 0, 25 ]
+    - [ 0, 1 ]
     - [ 5, 50 ]
     - [ 20, 100 ]
 
@@ -35,7 +35,7 @@ mcts:
     enabled: true
     num_games: 32
     num_threads: 32
-    num_iters: 10
+    num_iters: 1
     batch_size: 16
 
 training:

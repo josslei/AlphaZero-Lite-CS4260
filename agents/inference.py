@@ -34,6 +34,12 @@ class PyspielStateWrapper(State[int]):
     def apply_action(self, action: int) -> None:
         self.state.apply_action(action)
 
+    def current_player(self) -> int:
+        return self.state.current_player()
+
+    def returns(self) -> list[float]:
+        return self.state.returns()
+
     def is_chance_node(self) -> bool:
         return self.state.is_chance_node()
 

@@ -266,8 +266,13 @@ void SelfPlayEngine::backpropagate(Node *node, float value)
         cur->total_value += value;
         cur->mean_value = cur->total_value / cur->visit_count;
 
+        // [Fix Issue 3]: Conditional Negation
+        if (cur->parent != nullptr && cur->parent->player_id != cur->player_id)
+        {
+            value = -value;
+        }
+
         cur = cur->parent;
-        value = -value;
     }
 }
 
@@ -302,6 +307,9 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
         sim_state = current_state.Clone();
     }
 
+    // [NEW]: Ensure root has the current player_id
+    root->player_id = current_state.CurrentPlayer();
+
     for (int i = 0; i < num_iters; ++i)
     {
         // [FIX] Mathematical Early Stopping
@@ -326,7 +334,6 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
         }
 
         Node *cur_node = root;
-        open_spiel::Player last_player = open_spiel::kInvalidPlayer;
         int current_depth = 0;
 
         if (use_undo) {
@@ -339,11 +346,19 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 current_depth++;
                 advance_chance_nodes(sim_state.get(), &action_path);
                 if (sim_state->IsTerminal()) break;
-                last_player = sim_state->CurrentPlayer();
+                
+                open_spiel::Player current_p = sim_state->CurrentPlayer();
                 auto best = select_best_child(cur_node, sim_state->LegalActions());
                 sim_state->ApplyAction(best.first);
-                action_path.push_back({last_player, best.first});
+                action_path.push_back({current_p, best.first});
+                
                 cur_node = best.second;
+                // Synchronize player ID securely
+                if (!sim_state->IsTerminal()) {
+                    cur_node->player_id = sim_state->CurrentPlayer();
+                } else {
+                    cur_node->player_id = current_p; // Maintain alignment for terminal
+                }
             }
             advance_chance_nodes(sim_state.get(), &action_path);
 
@@ -351,10 +366,10 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             float value = 0.0f;
             if (sim_state->IsTerminal())
             {
-                if (last_player != open_spiel::kInvalidPlayer) {
-                    int next_player = 1 - last_player;
-                    value = sim_state->PlayerReturn(next_player);
+                if (cur_node->player_id < 0) {
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
                 }
+                value = sim_state->PlayerReturn(cur_node->player_id);
             }
             else
             {
@@ -362,6 +377,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 EvaluatorResult res = evaluator->evaluate(obs_vec.data());
                 expand_node(cur_node, *sim_state, res.policy);
                 value = res.value;
+                cur_node->player_id = sim_state->CurrentPlayer();
             }
 
             backpropagate(cur_node, value);
@@ -380,10 +396,17 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 current_depth++;
                 advance_chance_nodes(cur_state.get(), nullptr);
                 if (cur_state->IsTerminal()) break;
-                last_player = cur_state->CurrentPlayer();
+                
+                open_spiel::Player current_p = cur_state->CurrentPlayer();
                 auto best = select_best_child(cur_node, cur_state->LegalActions());
                 cur_state->ApplyAction(best.first);
+                
                 cur_node = best.second;
+                if (!cur_state->IsTerminal()) {
+                    cur_node->player_id = cur_state->CurrentPlayer();
+                } else {
+                    cur_node->player_id = current_p;
+                }
             }
             advance_chance_nodes(cur_state.get(), nullptr);
 
@@ -391,10 +414,10 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             float value = 0.0f;
             if (cur_state->IsTerminal())
             {
-                if (last_player != open_spiel::kInvalidPlayer) {
-                    int next_player = 1 - last_player;
-                    value = cur_state->PlayerReturn(next_player);
+                if (cur_node->player_id < 0) {
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
                 }
+                value = cur_state->PlayerReturn(cur_node->player_id);
             }
             else
             {
@@ -402,6 +425,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 EvaluatorResult res = evaluator->evaluate(obs_vec.data());
                 expand_node(cur_node, *cur_state, res.policy);
                 value = res.value;
+                cur_node->player_id = cur_state->CurrentPlayer();
             }
 
             backpropagate(cur_node, value);
