@@ -21,7 +21,7 @@ from agents.alphazero import AlphaZeroLightning
 from agents.replay_buffer import ReplayBuffer
 from agents.mcts import SelfPlayEngine
 from agents.game_spec import get_game_spec
-
+from agents.evaluation import create_agent
 
 def execute_self_play(
     config,
@@ -293,6 +293,142 @@ class SelfPlayCallback(Callback):
         print(f"<<< [Epoch {trainer.current_epoch}] Neural Network Training: END\n")
 
 
+class TournamentCallback(Callback):
+    """
+    Evaluates the current model against benchmark opponents (random, minimax, etc.) configured in yaml.
+    """
+    def __init__(self, config, obs_flat_size):
+        super().__init__()
+        self.config = config
+        self.obs_flat_size = obs_flat_size
+
+        eval_cfg = config.get("evaluation", {})
+        self.enabled = eval_cfg.get("enabled", False)
+        self.eval_interval = eval_cfg.get("interval", 1)
+        self.num_eval_games = eval_cfg.get("num_games", 10)
+        self.az_cfg = eval_cfg.get("alphazero", {"type": "alphazero", "engine": "python", "mcts_iters": 100})
+        self.opponents_cfg = eval_cfg.get("opponents", [])
+
+        self.game_name = config["game"]["name"]
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        if not self.enabled or not self.opponents_cfg:
+            return
+        if trainer.current_epoch % self.eval_interval != 0:
+            return
+
+        print(f"\n>>> [Epoch {trainer.current_epoch}] Tournament Evaluation: START (Games per opponent={self.num_eval_games})")
+
+        # Build an evaluation-specific model that returns probabilities
+        export_params = self.config["model"]["params"].copy()
+        export_params["return_logits"] = False
+
+        eval_model = get_model(self.config["model"]["architecture"], export_params)
+        eval_model.load_state_dict(pl_module.model.state_dict())
+        eval_model.to(pl_module.device)
+        eval_model.eval()
+
+        use_fp16 = self.config["system"].get("use_fp16", False)
+        if use_fp16:
+            eval_model.half()
+
+        # Evaluator suitable for Live PyTorch Modules (used by Python MCTS)
+        class LiveEvaluator:
+            def __init__(self, model, device, obs_size, is_fp16):
+                self.model = model
+                self.device = device
+                self.obs_size = obs_size
+                self.is_fp16 = is_fp16
+
+            def __call__(self, state):
+                obs = torch.tensor(state.observation_tensor(), dtype=torch.float32, device=self.device).view(1, self.obs_size)
+                if self.is_fp16:
+                    obs = obs.half()
+
+                with torch.no_grad():
+                    policy_probs, value = self.model(obs)
+                    policy_probs = policy_probs.cpu().numpy()[0]
+
+                legal_actions = state.legal_actions()
+                mask = np.zeros_like(policy_probs)
+                mask[legal_actions] = 1.0
+                masked_probs = policy_probs * mask
+
+                sum_p = masked_probs.sum()
+                if sum_p > 0:
+                    masked_probs /= sum_p
+                else:
+                    masked_probs[legal_actions] = 1.0 / len(legal_actions)
+
+                return {a: float(masked_probs[a]) for a in legal_actions}, value.item()
+
+        evaluator = LiveEvaluator(eval_model, pl_module.device, self.obs_flat_size, use_fp16)
+        
+        # Instantiate the AlphaZero agent explicitly once (or per opponent)
+        az_agent = create_agent(self.az_cfg, evaluator=evaluator)
+        game = pyspiel.load_game(self.game_name)
+
+        for opponent_cfg in self.opponents_cfg:
+            opp_type = opponent_cfg.get("type", "unknown")
+            try:
+                opponent = create_agent(opponent_cfg)
+            except NotImplementedError as e:
+                print(f"[WARNING] Skipping opponent '{opp_type}': {e}")
+                continue
+
+            wins, losses, draws = 0, 0, 0
+
+            for i in range(self.num_eval_games):
+                state = game.new_initial_state()
+                model_player = i % 2  # Alternate first player
+
+                # Pre-advance chance nodes 
+                while state.is_chance_node() and not state.is_terminal():
+                    outcomes = state.chance_outcomes()
+                    actions = [o[0] for o in outcomes]
+                    probs = np.array([o[1] for o in outcomes], dtype=np.float64)
+                    probs /= probs.sum()
+                    action = np.random.choice(actions, p=probs)
+                    state.apply_action(int(action))
+
+                while not state.is_terminal():
+                    if state.is_chance_node():
+                        outcomes = state.chance_outcomes()
+                        actions = [o[0] for o in outcomes]
+                        probs = np.array([o[1] for o in outcomes], dtype=np.float64)
+                        probs /= probs.sum()
+                        action = np.random.choice(actions, p=probs)
+                        state.apply_action(int(action))
+                        continue
+
+                    if state.current_player() == model_player:
+                        action = az_agent.get_action(state, model_player)
+                    else:
+                        action = opponent.get_action(state, state.current_player())
+
+                    state.apply_action(action)
+
+                returns = state.returns()
+                if returns[model_player] > 0:
+                    wins += 1
+                elif returns[model_player] < 0:
+                    losses += 1
+                else:
+                    draws += 1
+
+            win_rate = wins / self.num_eval_games
+            draw_rate = draws / self.num_eval_games
+
+            pl_module.log(f"eval/win_rate_vs_{opp_type}", float(win_rate), sync_dist=True)
+            pl_module.log(f"eval/draw_rate_vs_{opp_type}", float(draw_rate), sync_dist=True)
+
+            print(f">>> VS {opp_type.upper()}: Win Rate: {win_rate:.2%} | Draw Rate: {draw_rate:.2%}")
+
+        del eval_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser(description="AlphaZero General Training Script")
     parser.add_argument("--config", type=str, required=True, help="Path to the YAML config file")
@@ -399,6 +535,7 @@ def main():
         precision=precision,
         callbacks=[
             SelfPlayCallback(config=config, output_dir=run_dir, obs_flat_size=obs_flat_size),
+            TournamentCallback(config=config, obs_flat_size=obs_flat_size),
             ModelExportCallback(config=config, obs_flat_size=obs_flat_size),
             LearningRateMonitor(logging_interval="step"),
             checkpoint_callback,

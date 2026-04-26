@@ -52,3 +52,17 @@ system:
   devices: 1
   precision: "medium"
   use_fp16: false
+
+evaluation:
+  enabled: true
+  interval: 2
+  num_games: 10
+  alphazero:
+    type: "alphazero"
+    engine: "python"
+    mcts_iters: 100
+  opponents:
+    - type: "random"
+    # - type: "minimax"
+    #   depth: 3
+
