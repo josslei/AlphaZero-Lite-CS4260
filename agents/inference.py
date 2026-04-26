@@ -43,6 +43,9 @@ class PyspielStateWrapper(State[int]):
     def clone(self) -> "PyspielStateWrapper":
         return PyspielStateWrapper(self.state.clone())
 
+    def observation_tensor(self) -> list[float]:
+        return self.state.observation_tensor()
+
 
 class AlphaZeroEvaluator:
     def __init__(self, model_path: str, obs_flat_size: int, device: torch.device = default_device):

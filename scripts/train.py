@@ -6,6 +6,7 @@ import numpy as np
 import yaml
 import argparse
 import pyspiel
+from rich.progress import track
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
@@ -22,6 +23,7 @@ from agents.replay_buffer import ReplayBuffer
 from agents.mcts import SelfPlayEngine
 from agents.game_spec import get_game_spec
 from agents.evaluation import create_agent
+
 
 def execute_self_play(
     config,
@@ -297,6 +299,7 @@ class TournamentCallback(Callback):
     """
     Evaluates the current model against benchmark opponents (random, minimax, etc.) configured in yaml.
     """
+
     def __init__(self, config, obs_flat_size):
         super().__init__()
         self.config = config
@@ -306,7 +309,9 @@ class TournamentCallback(Callback):
         self.enabled = eval_cfg.get("enabled", False)
         self.eval_interval = eval_cfg.get("interval", 1)
         self.num_eval_games = eval_cfg.get("num_games", 10)
-        self.az_cfg = eval_cfg.get("alphazero", {"type": "alphazero", "engine": "python", "mcts_iters": 100})
+        self.az_cfg = eval_cfg.get(
+            "alphazero", {"type": "alphazero", "engine": "python", "mcts_iters": 100}
+        )
         self.opponents_cfg = eval_cfg.get("opponents", [])
 
         self.game_name = config["game"]["name"]
@@ -317,7 +322,9 @@ class TournamentCallback(Callback):
         if trainer.current_epoch % self.eval_interval != 0:
             return
 
-        print(f"\n>>> [Epoch {trainer.current_epoch}] Tournament Evaluation: START (Games per opponent={self.num_eval_games})")
+        print(
+            f"\n>>> [Epoch {trainer.current_epoch}] Tournament Evaluation: START (Games per opponent={self.num_eval_games})"
+        )
 
         # Build an evaluation-specific model that returns probabilities
         export_params = self.config["model"]["params"].copy()
@@ -341,7 +348,9 @@ class TournamentCallback(Callback):
                 self.is_fp16 = is_fp16
 
             def __call__(self, state):
-                obs = torch.tensor(state.observation_tensor(), dtype=torch.float32, device=self.device).view(1, self.obs_size)
+                obs = torch.tensor(
+                    state.observation_tensor(), dtype=torch.float32, device=self.device
+                ).view(1, self.obs_size)
                 if self.is_fp16:
                     obs = obs.half()
 
@@ -363,7 +372,7 @@ class TournamentCallback(Callback):
                 return {a: float(masked_probs[a]) for a in legal_actions}, value.item()
 
         evaluator = LiveEvaluator(eval_model, pl_module.device, self.obs_flat_size, use_fp16)
-        
+
         # Instantiate the AlphaZero agent explicitly once (or per opponent)
         az_agent = create_agent(self.az_cfg, evaluator=evaluator)
         game = pyspiel.load_game(self.game_name)
@@ -378,11 +387,11 @@ class TournamentCallback(Callback):
 
             wins, losses, draws = 0, 0, 0
 
-            for i in range(self.num_eval_games):
+            for i in track(range(self.num_eval_games), description=f"Evaluating vs {opp_type}"):
                 state = game.new_initial_state()
                 model_player = i % 2  # Alternate first player
 
-                # Pre-advance chance nodes 
+                # Pre-advance chance nodes
                 while state.is_chance_node() and not state.is_terminal():
                     outcomes = state.chance_outcomes()
                     actions = [o[0] for o in outcomes]
@@ -422,7 +431,9 @@ class TournamentCallback(Callback):
             pl_module.log(f"eval/win_rate_vs_{opp_type}", float(win_rate), sync_dist=True)
             pl_module.log(f"eval/draw_rate_vs_{opp_type}", float(draw_rate), sync_dist=True)
 
-            print(f">>> VS {opp_type.upper()}: Win Rate: {win_rate:.2%} | Draw Rate: {draw_rate:.2%}")
+            print(
+                f">>> VS {opp_type.upper()}: Win Rate: {win_rate:.2%} | Draw Rate: {draw_rate:.2%}"
+            )
 
         del eval_model
         if torch.cuda.is_available():
