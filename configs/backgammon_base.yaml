@@ -55,15 +55,17 @@ system:
 evaluation:
   # Light Tournament: runs every 'interval' epochs vs Greedy only, fully in C++
   enabled: true
-  interval: 1
-  num_games: 10  # configurable
-  num_threads: 10  # capped to num_games automatically; no point exceeding it
+  interval: 5
+  num_games: 6       # Backgammon games are ~280 moves long with a real greedy opponent;
+                     # 6 games gives a meaningful win-rate signal while staying fast.
+  num_threads: 6
   # opening_temp_moves: number of game plies for opening diversity
   opening_temp_moves: 2
   alphazero:
     type: "alphazero"
     engine: "cpp"
-    mcts_iters: 100
+    mcts_iters: 50   # Halved from 100 — MCTS quality doesn't scale linearly with iters when
+                     # the policy prior is reasonable; 50 is sufficient for evaluation.
   opponents:
     - type: "greedy"
     # Full tournament opponents:
@@ -71,9 +73,9 @@ evaluation:
 
 full_tournament:
   enabled: true             # Set to true to activate
-  interval: 10              # Run every N epochs
+  interval: 25              # Run every N epochs
   num_games: 100            # Games per opponent
-  num_threads: 16           # Worker threads (auto-capped to num_games)
+  num_threads: 100          # Worker threads (auto-capped to num_games)
   mcts_iters: 100           # Lower iters for backgammon (larger branching factor)
   device: "cuda"            # "cuda" or "cpu"
   use_undo: true            # Crucial for performance in Backgammon
