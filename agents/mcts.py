@@ -255,6 +255,7 @@ class TournamentEngine:
         c_puct: float = 1.0,
         use_fp16: bool = False,
         use_undo: bool = False,
+        opening_temp_moves: int = 0,
     ):
         if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
@@ -271,6 +272,7 @@ class TournamentEngine:
             c_puct,
             use_fp16,
             use_undo,
+            opening_temp_moves,
         )
 
     def play_tournament(self, num_games: int, game_name: str = "connect_four", opponent: str = "greedy"):

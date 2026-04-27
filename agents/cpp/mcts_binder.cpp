@@ -23,7 +23,7 @@ PYBIND11_MODULE(mcts_backend, m) {
         .def("get_metrics", &SelfPlayEngine::get_metrics);
 
     py::class_<TournamentEngine>(m, "TournamentEngine")
-        .def(py::init<const std::string&, int, int, int, int, float, float, bool, bool>(),
+        .def(py::init<const std::string&, int, int, int, int, float, float, bool, bool, int>(),
              py::arg("model_path"),
              py::arg("batch_size"),
              py::arg("obs_flat_size"),
@@ -32,7 +32,8 @@ PYBIND11_MODULE(mcts_backend, m) {
              py::arg("temperature"),
              py::arg("c_puct") = 1.0f,
              py::arg("use_fp16") = false,
-             py::arg("use_undo") = false)
+             py::arg("use_undo") = false,
+             py::arg("opening_temp_moves") = 0)
         .def("play_tournament", &TournamentEngine::play_tournament,
              py::arg("num_games"), py::arg("game_name"), py::arg("opponent"));
 }

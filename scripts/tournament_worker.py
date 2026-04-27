@@ -60,6 +60,8 @@ def run_worker(model_path: str, config: dict, log_dir: str, epoch: int, device: 
         f"iters={mcts_iters} device={device}"
     )
 
+    opening_temp_moves: int = full_cfg.get("opening_temp_moves", 2)
+
     engine = TournamentEngine(
         model_path=model_path,
         batch_size=batch_size,
@@ -70,6 +72,7 @@ def run_worker(model_path: str, config: dict, log_dir: str, epoch: int, device: 
         c_puct=c_puct,
         use_fp16=use_fp16,
         use_undo=use_undo,
+        opening_temp_moves=opening_temp_moves,
     )
 
     all_results: dict = {}

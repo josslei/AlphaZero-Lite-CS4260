@@ -369,6 +369,7 @@ class LightTournamentCallback(Callback):
         )
 
         # Temperature=0.0 → fully deterministic (greedy argmax) for evaluation
+        # opening_temp_moves → first N plies use temperature=1 to diversify openings
         engine = TournamentEngine(
             model_path=export_path,
             batch_size=batch_size,
@@ -377,7 +378,8 @@ class LightTournamentCallback(Callback):
             num_iters=self.az_cfg.get("mcts_iters", 100),
             temperature=0.0,
             c_puct=c_puct,
-            use_fp16=use_fp16
+            use_fp16=use_fp16,
+            opening_temp_moves=self.config.get("evaluation", {}).get("opening_temp_moves", 2),
         )
 
         for opponent_cfg in self.opponents_cfg:

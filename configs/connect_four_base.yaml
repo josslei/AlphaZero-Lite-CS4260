@@ -59,6 +59,10 @@ evaluation:
   interval: 1
   num_games: 10  # configurable
   num_threads: 10  # capped to num_games automatically; no point exceeding it
+  # opening_temp_moves: number of game plies where the model samples with temperature=1
+  # instead of greedy argmax. Diversifies openings so repeated games are not identical.
+  # Set to 0 to disable (pure greedy). Default: 2.
+  opening_temp_moves: 2
   alphazero:
     type: "alphazero"
     engine: "cpp"
@@ -78,6 +82,10 @@ full_tournament:
   mcts_iters: 200           # MCTS iterations per AZ move (can be higher than light tournament)
   device: "cuda"            # "cuda" or "cpu" — cuda is much faster but shares GPU with training
   use_undo: true            # Use in-place search for better performance
+  # opening_temp_moves: number of game plies where the model samples with temperature=1
+  # instead of greedy argmax. Diversifies openings so repeated games are not identical.
+  # Set to 0 to disable (pure greedy). Default: 2.
+  opening_temp_moves: 2
   opponents:
     - "random"
     - "greedy"

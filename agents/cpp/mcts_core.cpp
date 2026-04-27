@@ -496,13 +496,23 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
 
         if (temperature <= 1e-3f)
         {
+            // [Fix Issue 4]: Collect all maximally-visited actions and sample
+            // uniformly among ties, avoiding hash-map-order bias.
             int max_visits = -1;
+            std::vector<open_spiel::Action> best_actions;
             for (auto &pair : root->children) {
                 if (!legal_set.count(pair.first)) continue;
                 if (pair.second->visit_count > max_visits) {
                     max_visits = pair.second->visit_count;
-                    best_action = pair.first;
+                    best_actions.clear();
+                    best_actions.push_back(pair.first);
+                } else if (pair.second->visit_count == max_visits) {
+                    best_actions.push_back(pair.first);
                 }
+            }
+            if (!best_actions.empty()) {
+                std::uniform_int_distribution<int> tie_dist(0, (int)best_actions.size() - 1);
+                best_action = best_actions[tie_dist(rng)];
             }
             if (best_action != -1) pi[best_action] = 1.0f;
         }
@@ -832,8 +842,8 @@ open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& 
     return best_action;
 }
 
-TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16, bool use_undo)
-    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), use_undo(use_undo)
+TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16, bool use_undo, int opening_temp_moves)
+    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), use_undo(use_undo), opening_temp_moves(opening_temp_moves)
 {
     metrics = std::make_shared<PerfMetrics>();
     evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, obs_flat_size, metrics, use_fp16);
@@ -1050,22 +1060,37 @@ void TournamentEngine::play_match(const std::string& game_name, const std::strin
             
             std::vector<open_spiel::Action> legal_actions = state->LegalActions();
             absl::flat_hash_set<open_spiel::Action> legal_set(legal_actions.begin(), legal_actions.end());
-            
-            if (temperature <= 1e-3f) {
+
+            // [Fix Issue 3]: Use temperature=1 (visit-count proportional sampling) for the
+            // first opening_temp_moves game plies to diversify openings under deterministic eval.
+            float effective_temp = (opening_temp_moves > 0 && move_count < opening_temp_moves)
+                                   ? 1.0f : temperature;
+
+            if (effective_temp <= 1e-3f) {
+                // [Fix Issue 4]: Collect all maximally-visited actions and sample
+                // uniformly among ties, avoiding hash-map-order bias.
                 int max_visits = -1;
+                std::vector<open_spiel::Action> best_actions;
                 for (auto &pair : root->children) {
                     if (!legal_set.count(pair.first)) continue;
                     if (pair.second->visit_count > max_visits) {
                         max_visits = pair.second->visit_count;
-                        best_action = pair.first;
+                        best_actions.clear();
+                        best_actions.push_back(pair.first);
+                    } else if (pair.second->visit_count == max_visits) {
+                        best_actions.push_back(pair.first);
                     }
+                }
+                if (!best_actions.empty()) {
+                    std::uniform_int_distribution<int> tie_dist(0, (int)best_actions.size() - 1);
+                    best_action = best_actions[tie_dist(rng)];
                 }
             } else {
                 float sum = 0.0f;
                 absl::flat_hash_map<open_spiel::Action, float> weights;
                 for (auto &pair : root->children) {
                     if (!legal_set.count(pair.first)) continue;
-                    float w = std::pow(pair.second->visit_count, 1.0f / temperature);
+                    float w = std::pow(pair.second->visit_count, 1.0f / effective_temp);
                     weights[pair.first] = w;
                     sum += w;
                 }

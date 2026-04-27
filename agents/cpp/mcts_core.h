@@ -143,7 +143,10 @@ open_spiel::Action GetMinimaxAction(open_spiel::State& state, const std::string&
 class TournamentEngine
 {
 public:
-    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false, bool use_undo = false);
+    // opening_temp_moves: number of game plies at the start of each match where the model
+    // samples from a temperature=1 distribution instead of greedy argmax. This diversifies
+    // openings so that repeated games under temperature=0 are not identical.
+    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false, bool use_undo = false, int opening_temp_moves = 0);
     ~TournamentEngine();
 
     // Returns a dictionary with wins, losses, draws
@@ -166,4 +169,5 @@ private:
     float temperature;
     float c_puct;
     bool use_undo;
+    int opening_temp_moves; // plies with temperature=1 to diversify openings
 };
