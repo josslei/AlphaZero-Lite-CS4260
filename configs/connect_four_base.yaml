@@ -81,7 +81,7 @@ full_tournament:
   num_threads: 100           # Worker threads (auto-capped to num_games)
   mcts_iters: 200           # MCTS iterations per AZ move (can be higher than light tournament)
   device: "cuda"            # "cuda" or "cpu" — cuda is much faster but shares GPU with training
-  use_undo: true            # Use in-place search for better performance
+  use_undo: false           # Must be false for Connect Four; OpenSpiel's UndoAction leaves ghost pieces
   # opening_temp_moves: number of game plies where the model samples with temperature=1
   # instead of greedy argmax. Diversifies openings so repeated games are not identical.
   # Set to 0 to disable (pure greedy). Default: 2.

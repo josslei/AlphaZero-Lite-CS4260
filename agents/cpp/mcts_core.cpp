@@ -553,7 +553,8 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                             cur_node->player_id = sim_state->CurrentPlayer();
                         }
                     } else {
-                        cur_node->player_id = current_p;
+                        // Terminal: assign to opponent so backprop negates the +1 win correctly.
+                        cur_node->player_id = 1 - current_p;
                     }
                 }
 
@@ -643,7 +644,8 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                             cur_node->player_id = cur_state->CurrentPlayer();
                         }
                     } else {
-                        cur_node->player_id = current_p;
+                        // Terminal: assign to opponent so backprop negates the +1 win correctly.
+                        cur_node->player_id = 1 - current_p;
                     }
                 }
 
@@ -1436,7 +1438,8 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                             cur_node->player_id = sim_state->CurrentPlayer();
                         }
                     } else {
-                        cur_node->player_id = current_p;
+                        // Terminal: assign to opponent so backprop negates the +1 win correctly.
+                        cur_node->player_id = 1 - current_p;
                     }
                 }
                 if (sim_state->IsTerminal()) break;
@@ -1508,7 +1511,8 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                             cur_node->player_id = cur_state->CurrentPlayer();
                         }
                     } else {
-                        cur_node->player_id = current_p;
+                        // Terminal: assign to opponent so backprop negates the +1 win correctly.
+                        cur_node->player_id = 1 - current_p;
                     }
                 }
                 if (cur_state->IsTerminal()) break;

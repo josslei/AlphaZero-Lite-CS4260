@@ -82,7 +82,8 @@ class MCTS[S: State, A]:
                 if not cur_state.is_terminal():
                     cur_node.player_id = cur_state.current_player()
                 else:
-                    cur_node.player_id = cur_p
+                    # Terminal: assign to opponent so backprop negates the +1 win correctly.
+                    cur_node.player_id = 1 - cur_p
 
             # Step 2: Expansion & Evaluation
             value = 0.0
