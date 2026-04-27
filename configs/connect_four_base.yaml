@@ -11,7 +11,7 @@ model:
 
 mcts:
   # Search parameters
-  num_threads: 256
+  num_threads: 128
   batch_size: 64
   temperature: 1.0
   c_puct: 1.0
@@ -22,27 +22,27 @@ mcts:
 
   # Iteration Schedule: [start_epoch, num_iters]
   schedule:
-    - [ 0, 100 ]
-    - [ 5, 400 ]
-    - [ 20, 800 ]
+    - [ 0, 25 ]
+    - [ 5, 100 ]
+    - [ 20, 400 ]
 
   # Workload parameters
-  num_games_per_epoch: 256
+  num_games_per_epoch: 128
 
   # In-place ApplyAction/UndoAction (only for games that implement UndoAction)
   use_undo: false
 
   bootstrap:
     enabled: true
-    num_games: 64
-    num_threads: 64
-    num_iters: 100
-    batch_size: 32
+    num_games: 16
+    num_threads: 16
+    num_iters: 10
+    batch_size: 16
 
 training:
   learning_rate: 0.001
   weight_decay: 0.0001
-  batch_size: 64
+  batch_size: 256
   max_epochs: 50
   replay_buffer_size: 50000
   num_workers: 4
@@ -51,7 +51,7 @@ system:
   accelerator: "auto"
   devices: 1
   precision: "medium"
-  use_fp16: false
+  use_fp16: true
 
 evaluation:
   # Light Tournament: runs every 'interval' epochs vs Greedy only, fully in C++
