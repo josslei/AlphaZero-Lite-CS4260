@@ -11,7 +11,7 @@ model:
 mcts:
   # Search parameters
   num_threads: 256
-  batch_size: 32
+  batch_size: 256
   temperature: 1.0
   c_puct: 1.0
 
@@ -41,7 +41,7 @@ mcts:
     num_games: 16
     num_threads: 16
     num_iters: 10
-    batch_size: 16
+    batch_size: 256
 
 training:
   learning_rate: 0.001

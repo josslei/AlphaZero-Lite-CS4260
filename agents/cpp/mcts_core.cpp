@@ -425,8 +425,18 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                     batch_results = evaluator->evaluate_batch(batch_obs);
                 }
 
-                // Phase 3: combine terminal returns and NN values into E[v]
+                // Phase 3: combine terminal returns and NN values into E[v],
+                // and accumulate an expected policy for node expansion.
                 float expected_value = 0.0f;
+                // expected_policy[action] = sum_over_rolls( prob * policy[action] )
+                // We build this over the full action-space size from the first live result.
+                std::vector<float> expected_policy;
+                int policy_size = 0;
+                if (!batch_results.empty()) {
+                    policy_size = (int)batch_results[0].policy.size();
+                    expected_policy.resize(policy_size, 0.0f);
+                }
+
                 int live_idx = 0;
                 for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
                     auto& os = outcome_states[oi];
@@ -436,12 +446,30 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                         float v = batch_results[live_idx].value;
                         if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
                         expected_value += os.prob * v;
+                        // Accumulate weighted policy
+                        const auto& pol = batch_results[live_idx].policy;
+                        for (int a = 0; a < policy_size; ++a) {
+                            expected_policy[a] += os.prob * pol[a];
+                        }
                         live_idx++;
                     }
                 }
                 value = expected_value;
-                // Skip expand_node: this chance node remains un-expanded so future
-                // iterations revisit it and recompute the expectation fresh.
+
+                // Expand once: use the expected policy as priors so MCTS can descend
+                // past this chance node in subsequent iterations without re-evaluating.
+                // Use the first live outcome's post-roll state to get a concrete legal
+                // action set (actions available under at least one dice roll).
+                if (!cur_node->is_expanded && !expected_policy.empty()) {
+                    // Find first live outcome to get legal actions
+                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                        if (!outcome_states[oi].is_terminal) {
+                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
+                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
+                            break;
+                        }
+                    }
+                }
             } else {
                 // [Baseline] Original blind single-sample logic (use_undo branch)
                 advance_chance_nodes(sim_state.get(), &action_path);
@@ -528,6 +556,13 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 }
 
                 float expected_value = 0.0f;
+                std::vector<float> expected_policy;
+                int policy_size = 0;
+                if (!batch_results.empty()) {
+                    policy_size = (int)batch_results[0].policy.size();
+                    expected_policy.resize(policy_size, 0.0f);
+                }
+
                 int live_idx = 0;
                 for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
                     auto& os = outcome_states[oi];
@@ -537,10 +572,24 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                         float v = batch_results[live_idx].value;
                         if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
                         expected_value += os.prob * v;
+                        const auto& pol = batch_results[live_idx].policy;
+                        for (int a = 0; a < policy_size; ++a) {
+                            expected_policy[a] += os.prob * pol[a];
+                        }
                         live_idx++;
                     }
                 }
                 value = expected_value;
+
+                if (!cur_node->is_expanded && !expected_policy.empty()) {
+                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                        if (!outcome_states[oi].is_terminal) {
+                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
+                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
+                            break;
+                        }
+                    }
+                }
             } else {
                 // [Baseline] Original blind single-sample logic (clone branch)
                 advance_chance_nodes(cur_state.get(), nullptr);
@@ -1168,6 +1217,13 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 }
 
                 float expected_value = 0.0f;
+                std::vector<float> expected_policy;
+                int policy_size = 0;
+                if (!batch_results.empty()) {
+                    policy_size = (int)batch_results[0].policy.size();
+                    expected_policy.resize(policy_size, 0.0f);
+                }
+
                 int live_idx = 0;
                 for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
                     auto& os = outcome_states[oi];
@@ -1177,10 +1233,24 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                         float v = batch_results[live_idx].value;
                         if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
                         expected_value += os.prob * v;
+                        const auto& pol = batch_results[live_idx].policy;
+                        for (int a = 0; a < policy_size; ++a) {
+                            expected_policy[a] += os.prob * pol[a];
+                        }
                         live_idx++;
                     }
                 }
                 value = expected_value;
+
+                if (!cur_node->is_expanded && !expected_policy.empty()) {
+                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                        if (!outcome_states[oi].is_terminal) {
+                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
+                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
+                            break;
+                        }
+                    }
+                }
             } else {
                 // [Baseline] Original blind single-sample logic (use_undo branch)
                 advance_chance_nodes(sim_state.get(), &action_path);
@@ -1262,6 +1332,13 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 }
 
                 float expected_value = 0.0f;
+                std::vector<float> expected_policy;
+                int policy_size = 0;
+                if (!batch_results.empty()) {
+                    policy_size = (int)batch_results[0].policy.size();
+                    expected_policy.resize(policy_size, 0.0f);
+                }
+
                 int live_idx = 0;
                 for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
                     auto& os = outcome_states[oi];
@@ -1271,10 +1348,24 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                         float v = batch_results[live_idx].value;
                         if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
                         expected_value += os.prob * v;
+                        const auto& pol = batch_results[live_idx].policy;
+                        for (int a = 0; a < policy_size; ++a) {
+                            expected_policy[a] += os.prob * pol[a];
+                        }
                         live_idx++;
                     }
                 }
                 value = expected_value;
+
+                if (!cur_node->is_expanded && !expected_policy.empty()) {
+                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                        if (!outcome_states[oi].is_terminal) {
+                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
+                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
+                            break;
+                        }
+                    }
+                }
             } else {
                 // [Baseline] Original blind single-sample logic (clone branch)
                 advance_chance_nodes(cur_state.get(), nullptr);
