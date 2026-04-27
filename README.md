@@ -1,60 +1,74 @@
-# Multi-Game AlphaZero with OpenSpiel & Flet
+# AlphaZero-Lite: High-Performance Reinforcement Learning
 
-A custom implementation of the AlphaZero algorithm designed to master multiple games using the OpenSpiel framework, featuring an interactive Cross-Platform UI (Flet) for human-AI play.
+A modular, high-performance implementation of the AlphaZero algorithm for board games (Connect Four, Backgammon) using a C++ MCTS backend and PyTorch.
 
-## 🚀 Project Overview
-This project implements the AlphaZero algorithm from scratch, leveraging DeepMind's **OpenSpiel** for game mechanics and **PyTorch** for deep learning. The architecture is designed to handle diverse game structures, starting with:
-- **Connect Four:** 2D visual structure using Convolutional Neural Networks (CNN).
-- **Backgammon:** 1D array structure using Multi-Layer Perceptrons (MLP).
+## 🚀 Key Features
 
-An interactive **Flet** (Python + Flutter) dashboard allows users to select games, play against trained models, and visualize AI decision-making.
+- **Blazing Fast MCTS**: Core MCTS and Game Logic implemented in C++ with multi-threading.
+- **Zero-GIL Evaluation**: Tournament engine runs fully in C++, bypassing the Python Global Interpreter Lock.
+- **Batch Inference**: Thread-safe evaluation system that batches neural network requests across multiple MCTS workers for maximum GPU throughput.
+- **Asynchronous Tournaments**: Comprehensive evaluation against benchmark agents (Greedy, Minimax, Random) runs in detached background processes.
+- **Game Support**: Native support for Connect Four and Backgammon via OpenSpiel.
 
-## 🛠 Tech Stack
-- **RL Framework:** Custom AlphaZero (Self-play, MCTS, Policy/Value Network Updates).
-- **Game Engine:** [OpenSpiel](https://github.com/google-deepmind/open_spiel) (`pyspiel`).
-- **Deep Learning:** PyTorch.
-- **Web/Desktop UI:** Flet.
-- **Configuration:** YAML-based hyperparameter management.
+## 🛠 Setup & Installation
 
-## 📁 Directory Structure & Design Philosophy
+### 1. Environment Setup
+We recommend using [Conda](https://docs.conda.io/en/latest/) for dependency management:
 
-```text
-.
-├── ui/                     # INTERACTIVE UI (Flet)
-│   ├── app.py              # Main entry point (Routing & Window Config)
-│   └── views/              # Page-specific views
-│       ├── home.py         # Game selection hub
-│       ├── connect_four.py # Interactive Connect Four board
-│       └── backgammon.py   # Interactive Backgammon board
-├── agents/                 # AI ALGORITHM CORE
-│   ├── __init__.py
-│   ├── alphazero.py        # Controller for self-play loop and network updates
-│   ├── mcts.py             # Pure Monte Carlo Tree Search logic (game-agnostic)
-│   ├── networks.py         # Neural architectures (CNN for C4, MLP for Backgammon)
-│   ├── replay_buffer.py    # Experience replay storage and sampling
-│   └── utils.py            # Utility functions
-├── scripts/                # EXECUTION ENTRY POINTS
-├── configs/                # HYPERPARAMETERS
-├── outputs/                # ARTIFACTS
-├── requirements.txt        # Dependency management
-├── .gitignore              # Git exclusion rules
-└── README.md               # Project documentation
+```bash
+# Create the environment
+conda create -n rl python=3.12 -y
+conda activate rl
+
+# Install core dependencies
+pip install torch torchvision torchaudio
+pip install pytorch-lightning tensorboard pybind11 pyyaml absl-py open-spiel rich
 ```
 
-### Design Philosophy
-1.  **Modularity:** The `agents/` core is decoupled from the UI.
-2.  **Modern UI:** Leveraging Flet for a responsive, desktop-class interactive experience.
-3.  **Visualization-First:** The UI allows for immediate qualitative analysis of agent behavior.
+### 2. C++ Backend Dependencies
+The backend requires **LibTorch** (PyTorch C++ API). 
+- **macOS (Homebrew)**: `brew install libtorch`
+- **Linux/Manual**: Download the LibTorch zip from [pytorch.org](https://pytorch.org/get-started/locally/) and set `LIBTORCH_PATH`.
 
-### Observation Pipeline Convention
+### 3. Compiling the MCTS Engine
+The project includes a build script to compile the C++ extension and bind it to Python via PyBind11:
 
-The training and inference pipeline always passes **flat observation vectors** (as returned by open_spiel's `ObservationTensor()`) to the model. The **model network itself** is responsible for:
+```bash
+chmod +x build_cppmcts.sh
+./build_cppmcts.sh
+```
+*This will generate `agents/mcts_backend.so` (or `.dylib` on Mac), enabling high-speed self-play.*
 
-1. **Reshaping** the flat input to its preferred format (e.g., `(B, 126) → (B, 3, 6, 7)` for the Connect Four CNN).
-2. **Normalization** of observation values, if needed by the game (e.g., for games with non-binary observation values).
+## 🏁 How to Train
 
-This convention ensures that both the C++ MCTS self-play engine and the Python inference code can feed raw flat observations to the TorchScript-traced model, and all transforms are handled transparently inside the model's `forward()` pass. Nothing outside the model needs to know about game-specific observation structure or value ranges.
+Training is orchestrated via YAML configuration files.
 
-## 🚦 Getting Started
-1. Install dependencies: `pip install -r requirements.txt`
-2. Run the UI: `python3 ui/app.py`
+### Start Training (Connect Four)
+```bash
+python scripts/train.py --config configs/connect_four_base.yaml
+```
+
+### Start Training (Backgammon)
+```bash
+python scripts/train.py --config configs/backgammon_base.yaml
+```
+
+## 📊 Evaluation & Monitoring
+
+### TensorBoard
+Monitor training progress, loss, win rates, and engine performance (games/sec, MCTS depth):
+```bash
+tensorboard --logdir runs/
+```
+
+### Tournament Types
+1. **Light Tournament**: Runs every few epochs directly in the training loop against a Greedy opponent.
+2. **Full Tournament**: Runs asynchronously every $N$ epochs (configured in YAML) against multiple benchmark agents. It executes in a separate process to avoid slowing down training.
+
+## 📁 Project Structure
+
+- `agents/cpp/`: Core C++ implementation of MCTS and Batch Evaluator.
+- `agents/networks/`: PyTorch neural network architectures.
+- `configs/`: YAML files defining hyperparameters and evaluation settings.
+- `scripts/`: Entry points for training and background tournament workers.
+- `agents/game_spec.py`: Utilities for handling different game observation shapes.
