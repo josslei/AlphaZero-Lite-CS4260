@@ -54,15 +54,19 @@ system:
   use_fp16: false
 
 evaluation:
+  # Light Tournament: runs every 'interval' epochs vs Greedy only, fully in C++
   enabled: true
-  interval: 2
-  num_games: 10
+  interval: 1
+  num_games: 10  # configurable
+  num_threads: 10  # capped to num_games automatically; no point exceeding it
   alphazero:
     type: "alphazero"
-    engine: "python"
+    engine: "cpp"
     mcts_iters: 100
   opponents:
-    - type: "random"
+    - type: "greedy"
+    # Full tournament opponents (use a separate FullTournamentCallback later):
+    # - type: "random"
     # - type: "minimax"
     #   depth: 3
 

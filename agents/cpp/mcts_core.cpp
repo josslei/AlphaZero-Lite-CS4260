@@ -641,3 +641,339 @@ py::dict SelfPlayEngine::get_metrics() {
     d["max_search_depth"] = (double)metrics->max_search_depth.load();
     return d;
 }
+
+// ---------- TournamentEngine and Greedy ----------
+float EvaluateStateGreedy(const open_spiel::State& state, const std::string& game_name, open_spiel::Player player) {
+    if (state.IsTerminal()) {
+        return state.PlayerReturn(player);
+    }
+    
+    // Abstracted heuristic function placeholder
+    if (game_name == "connect_four") {
+        return 0.0f; // Connect four heuristic
+    } else if (game_name == "backgammon") {
+        return 0.0f; // Backgammon heuristic
+    }
+    return 0.0f;
+}
+
+open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& game_name) {
+    std::vector<open_spiel::Action> legal_actions = state.LegalActions();
+    if (legal_actions.empty()) return open_spiel::kInvalidAction;
+    
+    open_spiel::Player player = state.CurrentPlayer();
+    open_spiel::Action best_action = legal_actions[0];
+    float best_val = -1e9f;
+    
+    for (open_spiel::Action a : legal_actions) {
+        std::unique_ptr<open_spiel::State> next_state = state.Clone();
+        next_state->ApplyAction(a);
+        
+        if (next_state->IsTerminal()) {
+            float ret = next_state->PlayerReturn(player);
+            if (ret > 0) return a; 
+            if (ret > best_val) {
+                best_val = ret;
+                best_action = a;
+            }
+            continue;
+        }
+        
+        float val = EvaluateStateGreedy(*next_state, game_name, player);
+        if (val > best_val) {
+            best_val = val;
+            best_action = a;
+        }
+    }
+    
+    return best_action;
+}
+
+TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16)
+    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct)
+{
+    metrics = std::make_shared<PerfMetrics>();
+    evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, obs_flat_size, metrics, use_fp16);
+}
+
+TournamentEngine::~TournamentEngine() {}
+
+void TournamentEngine::expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy)
+{
+    if (node->is_expanded) return;
+
+    std::vector<open_spiel::Action> legal_actions = state.LegalActions();
+    for (open_spiel::Action action : legal_actions) {
+        float prob = (action >= 0 && action < static_cast<open_spiel::Action>(policy.size())) ? policy[action] : 0.0f;
+        node->children[action] = std::make_unique<Node>(node, prob);
+    }
+    node->is_expanded = true;
+}
+
+std::pair<open_spiel::Action, Node *> TournamentEngine::select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions)
+{
+    open_spiel::Action best_action = -1;
+    Node *best_child = nullptr;
+    float best_score = -1e9;
+    float sqrt_parent_visits = std::sqrt(std::max(1.0f, (float)node->visit_count));
+
+    for (open_spiel::Action action : legal_actions) {
+        if (!node->children.count(action)) {
+            node->children[action] = std::make_unique<Node>(node, 1.0f / std::max(1, (int)legal_actions.size()));
+        }
+
+        Node *child = node->children[action].get();
+        float q_value = child->visit_count > 0 ? -child->mean_value : 0.0f;
+        float u_value = c_puct * child->prior_prob * sqrt_parent_visits / (1.0f + child->visit_count);
+        float score = q_value + u_value;
+
+        if (score > best_score) {
+            best_score = score;
+            best_action = action;
+            best_child = child;
+        }
+    }
+    return {best_action, best_child};
+}
+
+void TournamentEngine::backpropagate(Node *node, float value)
+{
+    Node *cur = node;
+    while (cur != nullptr) {
+        cur->visit_count++;
+        cur->total_value += value;
+        cur->mean_value = cur->total_value / cur->visit_count;
+        if (cur->parent != nullptr && cur->parent->player_id != cur->player_id) {
+            value = -value;
+        }
+        cur = cur->parent;
+    }
+}
+
+void TournamentEngine::advance_chance_nodes(open_spiel::State* state)
+{
+    while (state->IsChanceNode() && !state->IsTerminal()) {
+        auto outcomes = state->ChanceOutcomes();
+        float r = dist(rng);
+        float cumulative = 0.0f;
+        open_spiel::Action sampled_action = outcomes[0].first;
+        for (auto& outcome : outcomes) {
+            cumulative += outcome.second;
+            if (r <= cumulative) {
+                sampled_action = outcome.first;
+                break;
+            }
+        }
+        state->ApplyAction(sampled_action);
+    }
+}
+
+void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
+{
+    root->player_id = current_state.CurrentPlayer();
+
+    for (int i = 0; i < num_iters; ++i) {
+        if (i > num_iters / 2 && i % 16 == 0) {
+            int max_v = -1, second_v = -1;
+            for (auto const& [action, child] : root->children) {
+                if (child->visit_count > max_v) {
+                    second_v = max_v;
+                    max_v = child->visit_count;
+                } else if (child->visit_count > second_v) {
+                    second_v = child->visit_count;
+                }
+            }
+            if (max_v > second_v + (num_iters - i)) {
+                metrics->iters_saved += (num_iters - i);
+                break;
+            }
+        }
+
+        Node *cur_node = root;
+        std::unique_ptr<open_spiel::State> cur_state = current_state.Clone();
+        int current_depth = 0;
+
+        while (cur_node->is_expanded) {
+            current_depth++;
+            advance_chance_nodes(cur_state.get());
+            if (cur_state->IsTerminal()) break;
+            
+            open_spiel::Player current_p = cur_state->CurrentPlayer();
+            auto best = select_best_child(cur_node, cur_state->LegalActions());
+            cur_state->ApplyAction(best.first);
+            
+            cur_node = best.second;
+            if (!cur_state->IsTerminal()) {
+                cur_node->player_id = cur_state->CurrentPlayer();
+            } else {
+                cur_node->player_id = current_p;
+            }
+        }
+        advance_chance_nodes(cur_state.get());
+
+        float value = 0.0f;
+        if (cur_state->IsTerminal()) {
+            if (cur_node->player_id < 0) {
+                cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+            }
+            value = cur_state->PlayerReturn(cur_node->player_id);
+        } else {
+            std::vector<float> obs_vec = cur_state->ObservationTensor();
+            EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+            expand_node(cur_node, *cur_state, res.policy);
+            value = res.value;
+            cur_node->player_id = cur_state->CurrentPlayer();
+        }
+
+        backpropagate(cur_node, value);
+        metrics->total_search_depth += current_depth;
+        metrics->num_searches++;
+        
+        int current_max = metrics->max_search_depth.load();
+        while (current_depth > current_max && 
+               !metrics->max_search_depth.compare_exchange_weak(current_max, current_depth)) {}
+    }
+}
+
+void TournamentEngine::play_match(const std::string& game_name, const std::string& opponent, int model_player, std::atomic<int>& wins, std::atomic<int>& losses, std::atomic<int>& draws, std::atomic<long long>& total_moves)
+{
+    std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame(game_name);
+    std::unique_ptr<open_spiel::State> state = game->NewInitialState();
+    
+    advance_chance_nodes(state.get());
+
+    int move_count = 0;
+    while (!state->IsTerminal()) {
+        open_spiel::Player current_p = state->CurrentPlayer();
+        open_spiel::Action best_action = -1;
+        
+        if (current_p == model_player) {
+            std::unique_ptr<Node> root = std::make_unique<Node>(nullptr, 1.0f);
+            std::vector<float> obs_vec = state->ObservationTensor();
+            EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+            expand_node(root.get(), *state, res.policy);
+            
+            run_mcts(root.get(), *state);
+            
+            std::vector<open_spiel::Action> legal_actions = state->LegalActions();
+            absl::flat_hash_set<open_spiel::Action> legal_set(legal_actions.begin(), legal_actions.end());
+            
+            if (temperature <= 1e-3f) {
+                int max_visits = -1;
+                for (auto &pair : root->children) {
+                    if (!legal_set.count(pair.first)) continue;
+                    if (pair.second->visit_count > max_visits) {
+                        max_visits = pair.second->visit_count;
+                        best_action = pair.first;
+                    }
+                }
+            } else {
+                float sum = 0.0f;
+                absl::flat_hash_map<open_spiel::Action, float> weights;
+                for (auto &pair : root->children) {
+                    if (!legal_set.count(pair.first)) continue;
+                    float w = std::pow(pair.second->visit_count, 1.0f / temperature);
+                    weights[pair.first] = w;
+                    sum += w;
+                }
+
+                float r = dist(rng);
+                float cumulative = 0.0f;
+                for (auto &pair : weights) {
+                    float prob = sum > 0 ? (pair.second / sum) : (1.0f / weights.size());
+                    cumulative += prob;
+                    if (r <= cumulative && best_action == -1) best_action = pair.first;
+                }
+                if (best_action == -1 && !weights.empty()) best_action = weights.begin()->first;
+            }
+            if (best_action == -1 && !legal_actions.empty()) best_action = legal_actions[0];
+        } else {
+            // Opponent Turn (Greedy)
+            if (opponent == "greedy") {
+                best_action = GetGreedyAction(*state, game_name);
+            } else {
+                // Random fallback
+                std::vector<open_spiel::Action> legal_actions = state->LegalActions();
+                if (!legal_actions.empty()) {
+                    std::uniform_int_distribution<int> distrib(0, legal_actions.size() - 1);
+                    best_action = legal_actions[distrib(rng)];
+                }
+            }
+        }
+        
+        if (best_action != -1) {
+            state->ApplyAction(best_action);
+            move_count++;
+        }
+        advance_chance_nodes(state.get());
+    }
+
+    std::vector<double> returns = state->Returns();
+    if (returns[model_player] > 0) wins++;
+    else if (returns[model_player] < 0) losses++;
+    else draws++;
+    total_moves += move_count;
+}
+
+py::dict TournamentEngine::play_tournament(int num_games, const std::string& game_name, const std::string& opponent)
+{
+    metrics->reset();
+    std::atomic<int> wins{0}, losses{0}, draws{0};
+    std::atomic<long long> total_moves{0};
+
+    auto start_total = std::chrono::high_resolution_clock::now();
+
+    {
+        py::gil_scoped_release release;
+        std::vector<std::thread> threads;
+        std::atomic<int> games_played{0};
+
+        for (int i = 0; i < num_threads; ++i) {
+            threads.emplace_back([&]() {
+                while (true) {
+                    int game_idx = games_played.fetch_add(1);
+                    if (game_idx >= num_games) break;
+                    int model_player = game_idx % 2; // Alternate who goes first
+                    play_match(game_name, opponent, model_player, wins, losses, draws, total_moves);
+                }
+            });
+        }
+        for (auto& t : threads) if (t.joinable()) t.join();
+    }
+
+    auto end_total = std::chrono::high_resolution_clock::now();
+    long long total_us = std::chrono::duration_cast<std::chrono::microseconds>(end_total - start_total).count();
+    double total_sec = total_us / 1e6;
+
+    int w = wins.load(), l = losses.load(), d = draws.load();
+    double avg_game_len = num_games > 0 ? (double)total_moves.load() / num_games : 0.0;
+    double avg_batch = metrics->total_batches > 0 ? (double)metrics->total_requests / metrics->total_batches : 0.0;
+
+    std::cout << "\n------------ Tournament Performance Monitor ------------" << std::endl;
+    std::cout << "Opponent: " << opponent << " | Games: " << num_games
+              << " | Threads: " << num_threads << " | Iters: " << num_iters << std::endl;
+    std::cout << "Total Time: " << std::fixed << std::setprecision(2) << total_sec
+              << "s  |  Games/sec: " << num_games / total_sec << std::endl;
+    std::cout << "Results: W=" << w << " L=" << l << " D=" << d
+              << "  |  Win Rate: " << std::setprecision(1) << 100.0 * w / std::max(1, num_games) << "%" << std::endl;
+    std::cout << "Avg Game Length: " << std::setprecision(1) << avg_game_len << " moves" << std::endl;
+    std::cout << "[Inference] Avg Batch: " << std::setprecision(2) << avg_batch
+              << "  |  Model Forward: " << metrics->forward_time_us / 1000.0 << " ms"
+              << "  |  Iters Saved: " << metrics->iters_saved.load() << std::endl;
+    std::cout << "-------------------------------------------------------\n" << std::endl;
+
+    py::gil_scoped_acquire acquire;
+    py::dict results;
+    results["wins"]           = w;
+    results["losses"]         = l;
+    results["draws"]          = d;
+    results["total_time_s"]   = total_sec;
+    results["games_per_sec"]  = num_games / total_sec;
+    results["avg_game_length"]= avg_game_len;
+    results["avg_batch_size"] = avg_batch;
+    results["iters_saved"]    = (long long)metrics->iters_saved.load();
+    results["avg_mcts_depth"] = metrics->num_searches > 0
+                                  ? (double)metrics->total_search_depth / metrics->num_searches
+                                  : 0.0;
+    return results;
+}

@@ -21,4 +21,17 @@ PYBIND11_MODULE(mcts_backend, m) {
         .def("generate_games", &SelfPlayEngine::generate_games, 
              py::arg("num_games"), py::arg("game_name"))
         .def("get_metrics", &SelfPlayEngine::get_metrics);
+
+    py::class_<TournamentEngine>(m, "TournamentEngine")
+        .def(py::init<const std::string&, int, int, int, int, float, float, bool>(),
+             py::arg("model_path"),
+             py::arg("batch_size"),
+             py::arg("obs_flat_size"),
+             py::arg("num_threads"),
+             py::arg("num_iters"),
+             py::arg("temperature"),
+             py::arg("c_puct") = 1.0f,
+             py::arg("use_fp16") = false)
+        .def("play_tournament", &TournamentEngine::play_tournament,
+             py::arg("num_games"), py::arg("game_name"), py::arg("opponent"));
 }

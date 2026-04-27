@@ -241,3 +241,35 @@ class SelfPlayEngine:
 
     def get_metrics(self):
         return self.engine.get_metrics()
+
+
+class TournamentEngine:
+    def __init__(
+        self,
+        model_path: str,
+        batch_size: int,
+        obs_flat_size: int,
+        num_threads: int,
+        num_iters: int,
+        temperature: float,
+        c_puct: float = 1.0,
+        use_fp16: bool = False,
+    ):
+        if not USE_CPP or mcts_backend is None:
+            raise RuntimeError("C++ MCTS backend is not available.")
+
+        # Accessing C++ class via getattr
+        engine_cls: type = getattr(mcts_backend, "TournamentEngine")
+        self.engine = engine_cls(
+            model_path,
+            batch_size,
+            obs_flat_size,
+            num_threads,
+            num_iters,
+            temperature,
+            c_puct,
+            use_fp16,
+        )
+
+    def play_tournament(self, num_games: int, game_name: str = "connect_four", opponent: str = "greedy"):
+        return self.engine.play_tournament(num_games, game_name, opponent)

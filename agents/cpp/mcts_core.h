@@ -133,3 +133,34 @@ private:
     float dirichlet_epsilon;
     bool use_undo;
 };
+
+// --- Tournament Engine and Greedy ---
+float EvaluateStateGreedy(const open_spiel::State& state, const std::string& game_name, open_spiel::Player player);
+open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& game_name);
+
+class TournamentEngine
+{
+public:
+    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false);
+    ~TournamentEngine();
+
+    // Returns a dictionary with wins, losses, draws
+    py::dict play_tournament(int num_games, const std::string& game_name, const std::string& opponent);
+
+private:
+    void play_match(const std::string& game_name, const std::string& opponent, int model_player, std::atomic<int>& wins, std::atomic<int>& losses, std::atomic<int>& draws, std::atomic<long long>& total_moves);
+    
+    void run_mcts(Node *root, open_spiel::State& current_state);
+    std::pair<open_spiel::Action, Node *> select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions);
+    void expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy);
+    void backpropagate(Node *node, float value);
+    void advance_chance_nodes(open_spiel::State* state);
+
+    std::shared_ptr<BatchEvaluator> evaluator;
+    std::shared_ptr<PerfMetrics> metrics;
+    int obs_flat_size;
+    int num_threads;
+    int num_iters;
+    float temperature;
+    float c_puct;
+};

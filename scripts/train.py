@@ -309,8 +309,14 @@ class TournamentCallback(Callback):
         self.enabled = eval_cfg.get("enabled", False)
         self.eval_interval = eval_cfg.get("interval", 1)
         self.num_eval_games = eval_cfg.get("num_games", 10)
+        # Tournament threads are capped at num_games — no point spawning more threads than games.
+        # Reads from evaluation.num_threads; falls back to min(num_games, 4).
+        self.num_threads = min(
+            eval_cfg.get("num_threads", min(self.num_eval_games, 4)),
+            self.num_eval_games,
+        )
         self.az_cfg = eval_cfg.get(
-            "alphazero", {"type": "alphazero", "engine": "python", "mcts_iters": 100}
+            "alphazero", {"type": "alphazero", "engine": "cpp", "mcts_iters": 100}
         )
         self.opponents_cfg = eval_cfg.get("opponents", [])
 
@@ -339,100 +345,86 @@ class TournamentCallback(Callback):
         if use_fp16:
             eval_model.half()
 
-        # Evaluator suitable for Live PyTorch Modules (used by Python MCTS)
-        class LiveEvaluator:
-            def __init__(self, model, device, obs_size, is_fp16):
-                self.model = model
-                self.device = device
-                self.obs_size = obs_size
-                self.is_fp16 = is_fp16
+        export_path = os.path.join(trainer.default_root_dir, f"eval_model.pt")
+        input_dtype = torch.float16 if use_fp16 else torch.float32
+        example_input = torch.randn(
+            1, self.obs_flat_size, device=pl_module.device, dtype=input_dtype
+        )
 
-            def __call__(self, state):
-                obs = torch.tensor(
-                    state.observation_tensor(), dtype=torch.float32, device=self.device
-                ).view(1, self.obs_size)
-                if self.is_fp16:
-                    obs = obs.half()
+        traced_model = cast(torch.jit.ScriptModule, torch.jit.trace(eval_model, example_input))
+        traced_model = torch.jit.optimize_for_inference(traced_model)
+        traced_model.save(export_path)
 
-                with torch.no_grad():
-                    policy_probs, value = self.model(obs)
-                    policy_probs = policy_probs.cpu().numpy()[0]
+        # 2. Instantiate the C++ TournamentEngine with tournament-specific thread count
+        from agents.mcts import TournamentEngine
 
-                legal_actions = state.legal_actions()
-                mask = np.zeros_like(policy_probs)
-                mask[legal_actions] = 1.0
-                masked_probs = policy_probs * mask
+        mcts_cfg = self.config["mcts"]
+        batch_size = mcts_cfg.get("batch_size", 16)
+        c_puct = mcts_cfg.get("c_puct", 1.0)
 
-                sum_p = masked_probs.sum()
-                if sum_p > 0:
-                    masked_probs /= sum_p
-                else:
-                    masked_probs[legal_actions] = 1.0 / len(legal_actions)
+        print(
+            f"    [Tournament] threads={self.num_threads}, games={self.num_eval_games}, "
+            f"iters={self.az_cfg.get('mcts_iters', 100)}"
+        )
 
-                return {a: float(masked_probs[a]) for a in legal_actions}, value.item()
-
-        evaluator = LiveEvaluator(eval_model, pl_module.device, self.obs_flat_size, use_fp16)
-
-        # Instantiate the AlphaZero agent explicitly once (or per opponent)
-        az_agent = create_agent(self.az_cfg, evaluator=evaluator)
-        game = pyspiel.load_game(self.game_name)
+        # Temperature=0.0 → fully deterministic (greedy argmax) for evaluation
+        engine = TournamentEngine(
+            model_path=export_path,
+            batch_size=batch_size,
+            obs_flat_size=self.obs_flat_size,
+            num_threads=self.num_threads,
+            num_iters=self.az_cfg.get("mcts_iters", 100),
+            temperature=0.0,
+            c_puct=c_puct,
+            use_fp16=use_fp16
+        )
 
         for opponent_cfg in self.opponents_cfg:
             opp_type = opponent_cfg.get("type", "unknown")
-            # If the opponent is of type 'alphazero', it will share the weights currently being trained.
-            # If the opponent is Random/Minimax, the evaluator parameter will be ignored.
-            opponent = create_agent(opponent_cfg, evaluator=evaluator)
+            
+            # The prompt requested Light C++ Tournament to only play against greedy
+            if opp_type != "greedy":
+                continue
 
-            wins, losses, draws = 0, 0, 0
+            # 3. Request C++ to parallel execute the tournament
+            results = engine.play_tournament(
+                num_games=self.num_eval_games,
+                game_name=self.game_name,
+                opponent=opp_type
+            )
+            
+            wins  = results["wins"]
+            losses = results["losses"]
+            draws  = results["draws"]
 
-            for i in track(range(self.num_eval_games), description=f"Evaluating vs {opp_type}"):
-                state = game.new_initial_state()
-                model_player = i % 2  # Alternate first player
+            win_rate  = wins  / max(1, self.num_eval_games)
+            loss_rate = losses / max(1, self.num_eval_games)
+            draw_rate = draws  / max(1, self.num_eval_games)
 
-                # Pre-advance chance nodes
-                while state.is_chance_node() and not state.is_terminal():
-                    outcomes = state.chance_outcomes()
-                    actions = [o[0] for o in outcomes]
-                    probs = np.array([o[1] for o in outcomes], dtype=np.float64)
-                    probs /= probs.sum()
-                    action = np.random.choice(actions, p=probs)
-                    state.apply_action(int(action))
-
-                while not state.is_terminal():
-                    if state.is_chance_node():
-                        outcomes = state.chance_outcomes()
-                        actions = [o[0] for o in outcomes]
-                        probs = np.array([o[1] for o in outcomes], dtype=np.float64)
-                        probs /= probs.sum()
-                        action = np.random.choice(actions, p=probs)
-                        state.apply_action(int(action))
-                        continue
-
-                    if state.current_player() == model_player:
-                        action = az_agent.get_action(state, model_player)
-                    else:
-                        action = opponent.get_action(state, state.current_player())
-
-                    state.apply_action(action)
-
-                returns = state.returns()
-                if returns[model_player] > 0:
-                    wins += 1
-                elif returns[model_player] < 0:
-                    losses += 1
-                else:
-                    draws += 1
-
-            win_rate = wins / self.num_eval_games
-            draw_rate = draws / self.num_eval_games
-
-            pl_module.log(f"eval/win_rate_vs_{opp_type}", float(win_rate), sync_dist=True)
-            pl_module.log(f"eval/draw_rate_vs_{opp_type}", float(draw_rate), sync_dist=True)
+            # --- Game outcome metrics ---
+            pl_module.log(f"eval/win_rate_vs_{opp_type}",    float(win_rate),                      prog_bar=True, sync_dist=True)
+            pl_module.log(f"eval/loss_rate_vs_{opp_type}",   float(loss_rate),                     sync_dist=True)
+            pl_module.log(f"eval/draw_rate_vs_{opp_type}",   float(draw_rate),                     sync_dist=True)
+            # --- Throughput metrics ---
+            pl_module.log(f"eval/total_time_s_{opp_type}",   float(results["total_time_s"]),        sync_dist=True)
+            pl_module.log(f"eval/games_per_sec_{opp_type}",  float(results["games_per_sec"]),      sync_dist=True)
+            # --- Game quality metrics ---
+            pl_module.log(f"eval/avg_game_length_{opp_type}",float(results["avg_game_length"]),    sync_dist=True)
+            # --- MCTS efficiency metrics ---
+            pl_module.log(f"eval/avg_batch_size_{opp_type}", float(results["avg_batch_size"]),     sync_dist=True)
+            pl_module.log(f"eval/avg_mcts_depth_{opp_type}", float(results["avg_mcts_depth"]),     sync_dist=True)
+            pl_module.log(f"eval/iters_saved_{opp_type}",    float(results["iters_saved"]),        sync_dist=True)
 
             print(
-                f">>> VS {opp_type.upper()}: Win Rate: {win_rate:.2%} | Draw Rate: {draw_rate:.2%}"
+                f">>> C++ Tournament VS {opp_type.upper()}: "
+                f"Win={win_rate:.0%} Loss={loss_rate:.0%} Draw={draw_rate:.0%} | "
+                f"{results['games_per_sec']:.2f} games/s | "
+                f"Avg len: {results['avg_game_length']:.1f} moves | "
+                f"Time: {results['total_time_s']:.1f}s"
             )
 
+
+        del engine
         del eval_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
