@@ -143,7 +143,7 @@ open_spiel::Action GetMinimaxAction(open_spiel::State& state, const std::string&
 class TournamentEngine
 {
 public:
-    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false);
+    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false, bool use_undo = false);
     ~TournamentEngine();
 
     // Returns a dictionary with wins, losses, draws
@@ -156,7 +156,7 @@ private:
     std::pair<open_spiel::Action, Node *> select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions);
     void expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy);
     void backpropagate(Node *node, float value);
-    void advance_chance_nodes(open_spiel::State* state);
+    void advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path = nullptr);
 
     std::shared_ptr<BatchEvaluator> evaluator;
     std::shared_ptr<PerfMetrics> metrics;
@@ -165,4 +165,5 @@ private:
     int num_iters;
     float temperature;
     float c_puct;
+    bool use_undo;
 };

@@ -251,9 +251,10 @@ class TournamentEngine:
         obs_flat_size: int,
         num_threads: int,
         num_iters: int,
-        temperature: float,
+        temperature: float = 0.0,
         c_puct: float = 1.0,
         use_fp16: bool = False,
+        use_undo: bool = False,
     ):
         if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
@@ -269,6 +270,7 @@ class TournamentEngine:
             temperature,
             c_puct,
             use_fp16,
+            use_undo,
         )
 
     def play_tournament(self, num_games: int, game_name: str = "connect_four", opponent: str = "greedy"):

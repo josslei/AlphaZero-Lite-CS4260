@@ -76,6 +76,7 @@ full_tournament:
   num_threads: 16           # Worker threads (auto-capped to num_games)
   mcts_iters: 100           # Lower iters for backgammon (larger branching factor)
   device: "cuda"            # "cuda" or "cpu"
+  use_undo: true            # Crucial for performance in Backgammon
   opponents:
     - "random"
     - "greedy"              # Backgammon-specific heuristic (stub — implement when ready)

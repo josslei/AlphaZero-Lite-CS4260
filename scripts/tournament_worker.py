@@ -41,6 +41,7 @@ def run_worker(model_path: str, config: dict, log_dir: str, epoch: int, device: 
     mcts_iters: int = full_cfg.get("mcts_iters", 200)
     batch_size: int = full_cfg.get("batch_size", mcts_cfg.get("batch_size", 16))
     c_puct: float = mcts_cfg.get("c_puct", 1.0)
+    use_undo: bool = full_cfg.get("use_undo", mcts_cfg.get("use_undo", False))
     opponents: list = full_cfg.get("opponents", ["random", "greedy"])
 
     use_fp16: bool = config["system"].get("use_fp16", False)
@@ -68,6 +69,7 @@ def run_worker(model_path: str, config: dict, log_dir: str, epoch: int, device: 
         temperature=0.0,   # Fully deterministic evaluation
         c_puct=c_puct,
         use_fp16=use_fp16,
+        use_undo=use_undo,
     )
 
     all_results: dict = {}

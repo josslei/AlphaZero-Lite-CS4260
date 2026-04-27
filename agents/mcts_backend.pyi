@@ -31,6 +31,7 @@ class TournamentEngine:
         temperature: float,
         c_puct: float = 1.0,
         use_fp16: bool = False,
+        use_undo: bool = False,
     ) -> None: ...
     def play_tournament(
         self, num_games: int, game_name: str = "connect_four", opponent: str = "greedy"

@@ -832,8 +832,8 @@ open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& 
     return best_action;
 }
 
-TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16)
-    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct)
+TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16, bool use_undo)
+    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), use_undo(use_undo)
 {
     metrics = std::make_shared<PerfMetrics>();
     evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, obs_flat_size, metrics, use_fp16);
@@ -893,7 +893,7 @@ void TournamentEngine::backpropagate(Node *node, float value)
     }
 }
 
-void TournamentEngine::advance_chance_nodes(open_spiel::State* state)
+void TournamentEngine::advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path)
 {
     while (state->IsChanceNode() && !state->IsTerminal()) {
         auto outcomes = state->ChanceOutcomes();
@@ -907,12 +907,18 @@ void TournamentEngine::advance_chance_nodes(open_spiel::State* state)
                 break;
             }
         }
+        if (action_path) action_path->push_back({state->CurrentPlayer(), sampled_action});
         state->ApplyAction(sampled_action);
     }
 }
 
 void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
 {
+    std::unique_ptr<open_spiel::State> sim_state;
+    if (use_undo) {
+        sim_state = current_state.Clone();
+    }
+
     root->player_id = current_state.CurrentPlayer();
 
     for (int i = 0; i < num_iters; ++i) {
@@ -933,42 +939,86 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
         }
 
         Node *cur_node = root;
-        std::unique_ptr<open_spiel::State> cur_state = current_state.Clone();
         int current_depth = 0;
 
-        while (cur_node->is_expanded) {
-            current_depth++;
-            advance_chance_nodes(cur_state.get());
-            if (cur_state->IsTerminal()) break;
+        if (use_undo) {
+            std::vector<std::pair<open_spiel::Player, open_spiel::Action>> action_path;
             
-            open_spiel::Player current_p = cur_state->CurrentPlayer();
-            auto best = select_best_child(cur_node, cur_state->LegalActions());
-            cur_state->ApplyAction(best.first);
-            
-            cur_node = best.second;
-            if (!cur_state->IsTerminal()) {
-                cur_node->player_id = cur_state->CurrentPlayer();
+            while (cur_node->is_expanded) {
+                current_depth++;
+                advance_chance_nodes(sim_state.get(), &action_path);
+                if (sim_state->IsTerminal()) break;
+                
+                open_spiel::Player current_p = sim_state->CurrentPlayer();
+                auto best = select_best_child(cur_node, sim_state->LegalActions());
+                sim_state->ApplyAction(best.first);
+                action_path.push_back({current_p, best.first});
+                
+                cur_node = best.second;
+                if (!sim_state->IsTerminal()) {
+                    cur_node->player_id = sim_state->CurrentPlayer();
+                } else {
+                    cur_node->player_id = current_p;
+                }
+            }
+            advance_chance_nodes(sim_state.get(), &action_path);
+
+            float value = 0.0f;
+            if (sim_state->IsTerminal()) {
+                if (cur_node->player_id < 0) {
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                }
+                value = sim_state->PlayerReturn(cur_node->player_id);
             } else {
-                cur_node->player_id = current_p;
+                std::vector<float> obs_vec = sim_state->ObservationTensor();
+                EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                expand_node(cur_node, *sim_state, res.policy);
+                value = res.value;
+                cur_node->player_id = sim_state->CurrentPlayer();
             }
-        }
-        advance_chance_nodes(cur_state.get());
 
-        float value = 0.0f;
-        if (cur_state->IsTerminal()) {
-            if (cur_node->player_id < 0) {
-                cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+            backpropagate(cur_node, value);
+
+            for (auto it = action_path.rbegin(); it != action_path.rend(); ++it) {
+                sim_state->UndoAction(it->first, it->second);
             }
-            value = cur_state->PlayerReturn(cur_node->player_id);
         } else {
-            std::vector<float> obs_vec = cur_state->ObservationTensor();
-            EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-            expand_node(cur_node, *cur_state, res.policy);
-            value = res.value;
-            cur_node->player_id = cur_state->CurrentPlayer();
-        }
+            std::unique_ptr<open_spiel::State> cur_state = current_state.Clone();
+            while (cur_node->is_expanded) {
+                current_depth++;
+                advance_chance_nodes(cur_state.get(), nullptr);
+                if (cur_state->IsTerminal()) break;
+                
+                open_spiel::Player current_p = cur_state->CurrentPlayer();
+                auto best = select_best_child(cur_node, cur_state->LegalActions());
+                cur_state->ApplyAction(best.first);
+                
+                cur_node = best.second;
+                if (!cur_state->IsTerminal()) {
+                    cur_node->player_id = cur_state->CurrentPlayer();
+                } else {
+                    cur_node->player_id = current_p;
+                }
+            }
+            advance_chance_nodes(cur_state.get(), nullptr);
 
-        backpropagate(cur_node, value);
+            float value = 0.0f;
+            if (cur_state->IsTerminal()) {
+                if (cur_node->player_id < 0) {
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                }
+                value = cur_state->PlayerReturn(cur_node->player_id);
+            } else {
+                std::vector<float> obs_vec = cur_state->ObservationTensor();
+                EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                expand_node(cur_node, *cur_state, res.policy);
+                value = res.value;
+                cur_node->player_id = cur_state->CurrentPlayer();
+            }
+
+            backpropagate(cur_node, value);
+        }
+        
         metrics->total_search_depth += current_depth;
         metrics->num_searches++;
         
@@ -983,7 +1033,7 @@ void TournamentEngine::play_match(const std::string& game_name, const std::strin
     std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame(game_name);
     std::unique_ptr<open_spiel::State> state = game->NewInitialState();
     
-    advance_chance_nodes(state.get());
+    advance_chance_nodes(state.get(), nullptr);
 
     int move_count = 0;
     while (!state->IsTerminal()) {
@@ -1057,7 +1107,7 @@ void TournamentEngine::play_match(const std::string& game_name, const std::strin
             state->ApplyAction(best_action);
             move_count++;
         }
-        advance_chance_nodes(state.get());
+        advance_chance_nodes(state.get(), nullptr);
     }
 
     std::vector<double> returns = state->Returns();
