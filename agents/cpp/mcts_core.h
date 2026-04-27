@@ -63,6 +63,10 @@ public:
     ~BatchEvaluator();
 
     EvaluatorResult evaluate(const float* obs_data);
+    // Submit a batch of observations in one shot; returns results in the same order.
+    // Designed for chance_aware mode: all dice outcomes are sent simultaneously so
+    // the GPU can process them in a single (or few) batches instead of sequentially.
+    std::vector<EvaluatorResult> evaluate_batch(const std::vector<std::vector<float>>& obs_batch);
     void run_inference();
 
 private:
@@ -73,8 +77,10 @@ private:
     bool stop_flag = false;
     torch::Device device{torch::kCPU};
 
-    // Pre-allocated batch buffer filled by inference thread from queue
-    torch::Tensor batch_buffer;       // [batch_size, obs_flat_size] pinned CPU
+    // Pre-allocated FP32 batch buffer on CPU (pinned for fast DMA).
+    // FP16 conversion is done on the GPU after device transfer — cheaper than
+    // element-wise CPU loops, especially for large Backgammon observations.
+    torch::Tensor batch_buffer;       // [batch_size, obs_flat_size] FP32 pinned CPU
 
     std::mutex m_mutex;
     std::condition_variable cv_batch;

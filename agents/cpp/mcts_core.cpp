@@ -37,12 +37,12 @@ BatchEvaluator::BatchEvaluator(const std::string &model_path, int batch_size, in
         std::cerr << "Error loading model from " << model_path << ": " << e.what() << "\n";
     }
 
-    // Pre-allocate the CPU batch buffer (pinned memory for fast DMA on CUDA)
-    auto dtype = use_fp16 ? torch::kFloat16 : torch::kFloat32;
+    // Always FP32 on CPU: GPU-side .to(kHalf) is much faster than element-wise CPU loops,
+    // especially for large observation tensors (e.g. Backgammon's 1350-float obs).
     if (device.is_cuda()) {
-        batch_buffer = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(dtype).pinned_memory(true));
+        batch_buffer = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
     } else {
-        batch_buffer = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(dtype));
+        batch_buffer = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(torch::kFloat32));
     }
 
     std::cout << "[C++] Pre-allocated batch buffer: [" << batch_size << ", " << obs_flat_size << "] "
@@ -83,13 +83,51 @@ EvaluatorResult BatchEvaluator::evaluate(const float* obs_data)
     return result;
 }
 
+// Submit N observations in one shot.  All promises are enqueued before any are awaited,
+// so the inference thread can drain them together in a single (or few) GPU batch(es)
+// rather than doing N serial round-trips. This is critical for chance_aware mode where
+// up to 21 dice outcomes must be evaluated per MCTS iteration.
+std::vector<EvaluatorResult> BatchEvaluator::evaluate_batch(const std::vector<std::vector<float>>& obs_batch)
+{
+    int n = (int)obs_batch.size();
+    std::vector<std::future<EvaluatorResult>> futures;
+    futures.reserve(n);
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Enqueue all requests at once under a single lock to minimise contention
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& obs : obs_batch) {
+            std::promise<EvaluatorResult> promise;
+            futures.push_back(promise.get_future());
+            queue.push({obs, std::move(promise)});
+        }
+        // Wake inference thread once; it will drain as many as it can per iteration
+        cv_batch.notify_all();
+    }
+
+    // Collect results in submission order
+    std::vector<EvaluatorResult> results;
+    results.reserve(n);
+    for (auto& f : futures) {
+        results.push_back(f.get());
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    metrics->mcts_eval_wait_time_us += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    return results;
+}
+
 void BatchEvaluator::run_inference()
 {
-    // JIT & CuDNN Warmup
+    // JIT & CuDNN Warmup — always use FP32 input; cast to FP16 on device if needed
     try {
         torch::NoGradGuard no_grad;
-        auto dtype = use_fp16 ? torch::kFloat16 : torch::kFloat32;
-        auto dummy_input = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(dtype).device(device));
+        auto dummy_input = torch::zeros({batch_size, obs_flat_size}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        if (use_fp16 && device.is_cuda()) {
+            dummy_input = dummy_input.to(torch::kFloat16);
+        }
         model.forward({dummy_input});
         if (device.is_cuda()) {
             torch::cuda::synchronize();
@@ -117,32 +155,26 @@ void BatchEvaluator::run_inference()
 
         int current_batch_size = std::min((int)queue.size(), batch_size);
 
-        // Drain queue into pre-allocated buffer via memcpy (no torch::cat needed)
+        // Drain queue into pre-allocated FP32 buffer via memcpy — no per-element CPU loops
         auto cat_start = std::chrono::high_resolution_clock::now();
         std::vector<std::promise<EvaluatorResult>> batch_promises;
         batch_promises.reserve(current_batch_size);
 
+        float* buf_ptr = batch_buffer.data_ptr<float>();
         for (int i = 0; i < current_batch_size; ++i)
         {
             auto req = std::move(queue.front());
             queue.pop();
-
-            if (use_fp16) {
-                auto accessor = batch_buffer.accessor<at::Half, 2>();
-                for (int j = 0; j < obs_flat_size; ++j) {
-                    accessor[i][j] = static_cast<at::Half>(req.obs[j]);
-                }
-            } else {
-                float* dest = batch_buffer.data_ptr<float>() + i * obs_flat_size;
-                std::memcpy(dest, req.obs.data(), obs_flat_size * sizeof(float));
-            }
-
+            std::memcpy(buf_ptr + i * obs_flat_size, req.obs.data(), obs_flat_size * sizeof(float));
             batch_promises.push_back(std::move(req.promise));
         }
         lock.unlock();
 
-        // Transfer buffer to device (single contiguous copy, no torch::cat)
-        torch::Tensor input = batch_buffer.to(device);
+        // Transfer FP32 buffer to device; cast to FP16 on the GPU if needed (single kernel, very fast)
+        torch::Tensor input = batch_buffer.slice(0, 0, current_batch_size).to(device);
+        if (use_fp16 && device.is_cuda()) {
+            input = input.to(torch::kFloat16);
+        }
         auto cat_end = std::chrono::high_resolution_clock::now();
         metrics->cat_time_us += std::chrono::duration_cast<std::chrono::microseconds>(cat_end - cat_start).count();
 
@@ -156,34 +188,24 @@ void BatchEvaluator::run_inference()
 
             auto p_start = std::chrono::high_resolution_clock::now();
 
-            // 1. Get tensors (data still resides on GPU at this point)
+            // 1. Get tensors (may be FP16 on GPU)
             torch::Tensor policy_tensor = output->elements()[0].toTensor();
             torch::Tensor value_tensor = output->elements()[1].toTensor();
 
-            // 2. Force FP16 to FP32 conversion on the GPU
-            if (use_fp16 && policy_tensor.scalar_type() == torch::kHalf) {
-                policy_tensor = policy_tensor.to(torch::kFloat32);
-                value_tensor = value_tensor.to(torch::kFloat32);
-            }
-
-            // 3. Perform D2H memory transfer (transferring FP32 data)
-            policy_tensor = policy_tensor.to(torch::kCPU).contiguous();
-            value_tensor = value_tensor.to(torch::kCPU).contiguous();
+            // 2. D2H transfer — cast to FP32 and move to CPU in one fused op
+            policy_tensor = policy_tensor.to(torch::kCPU, torch::kFloat32, /*non_blocking=*/false, /*copy=*/false).contiguous();
+            value_tensor  = value_tensor.to(torch::kCPU, torch::kFloat32, /*non_blocking=*/false, /*copy=*/false).contiguous();
 
             float* policy_ptr = policy_tensor.data_ptr<float>();
-            float* value_ptr = value_tensor.data_ptr<float>();
-            int num_actions = policy_tensor.size(1);
+            float* value_ptr  = value_tensor.data_ptr<float>();
+            int num_actions   = policy_tensor.size(1);
 
             for (int i = 0; i < current_batch_size; ++i)
             {
                 EvaluatorResult res;
                 res.value = value_ptr[i];
-                
-                // 4. Allocate exact memory for the vector and use low-level block copy 
-                // instead of element-wise loop assignment
                 res.policy.resize(num_actions);
                 std::memcpy(res.policy.data(), policy_ptr + i * num_actions, num_actions * sizeof(float));
-                
                 batch_promises[i].set_value(std::move(res));
             }
             auto p_end = std::chrono::high_resolution_clock::now();
@@ -365,27 +387,56 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
             // [Core Modification] Omniscient Expectation vs. Baseline single-sample
             if (chance_aware && sim_state->IsChanceNode()) {
-                // [Experimental] Fully expand all dice outcomes and compute \E[v]
-                float expected_value = 0.0f;
+                // [Optimized] Batch-evaluate all dice outcomes simultaneously so the
+                // GPU can process them in a single pass instead of N serial round-trips.
                 auto outcomes = sim_state->ChanceOutcomes();
+
+                // Phase 1: advance each outcome's clone and separate terminal vs. live states
+                struct OutcomeState {
+                    float prob;
+                    std::unique_ptr<open_spiel::State> state;
+                    bool is_terminal;
+                    open_spiel::Player pid; // only valid when is_terminal
+                };
+                std::vector<OutcomeState> outcome_states;
+                outcome_states.reserve(outcomes.size());
+
+                std::vector<std::vector<float>> batch_obs;  // observations for live states
+                std::vector<int> live_indices;              // maps batch_obs[i] -> outcome_states[j]
+
                 for (const auto& outcome : outcomes) {
                     auto clone_state = sim_state->Clone();
                     clone_state->ApplyAction(outcome.first);
-                    advance_chance_nodes(clone_state.get(), nullptr); // fast-forward nested chance
-                    if (clone_state->IsTerminal()) {
-                        open_spiel::Player pid = cur_node->player_id < 0
-                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                            : cur_node->player_id;
-                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    advance_chance_nodes(clone_state.get(), nullptr);
+                    bool terminal = clone_state->IsTerminal();
+                    open_spiel::Player pid = cur_node->player_id < 0
+                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                        : cur_node->player_id;
+                    if (!terminal) {
+                        batch_obs.push_back(clone_state->ObservationTensor());
+                        live_indices.push_back((int)outcome_states.size());
+                    }
+                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
+                }
+
+                // Phase 2: single batched NN call for all live states
+                std::vector<EvaluatorResult> batch_results;
+                if (!batch_obs.empty()) {
+                    batch_results = evaluator->evaluate_batch(batch_obs);
+                }
+
+                // Phase 3: combine terminal returns and NN values into E[v]
+                float expected_value = 0.0f;
+                int live_idx = 0;
+                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                    auto& os = outcome_states[oi];
+                    if (os.is_terminal) {
+                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
                     } else {
-                        std::vector<float> obs_vec = clone_state->ObservationTensor();
-                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                        float v = res.value;
-                        // Perspective alignment: flip if clone is now opponent's turn
-                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
-                            v = -v;
-                        }
-                        expected_value += outcome.second * v;
+                        float v = batch_results[live_idx].value;
+                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
+                        expected_value += os.prob * v;
+                        live_idx++;
                     }
                 }
                 value = expected_value;
@@ -441,26 +492,52 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
             // [Core Modification] Omniscient Expectation vs. Baseline single-sample
             if (chance_aware && cur_state->IsChanceNode()) {
-                // [Experimental] Fully expand all dice outcomes and compute \E[v]
-                float expected_value = 0.0f;
+                // [Optimized] Batch-evaluate all dice outcomes simultaneously.
                 auto outcomes = cur_state->ChanceOutcomes();
+
+                struct OutcomeState {
+                    float prob;
+                    std::unique_ptr<open_spiel::State> state;
+                    bool is_terminal;
+                    open_spiel::Player pid;
+                };
+                std::vector<OutcomeState> outcome_states;
+                outcome_states.reserve(outcomes.size());
+
+                std::vector<std::vector<float>> batch_obs;
+                std::vector<int> live_indices;
+
                 for (const auto& outcome : outcomes) {
                     auto clone_state = cur_state->Clone();
                     clone_state->ApplyAction(outcome.first);
                     advance_chance_nodes(clone_state.get(), nullptr);
-                    if (clone_state->IsTerminal()) {
-                        open_spiel::Player pid = cur_node->player_id < 0
-                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                            : cur_node->player_id;
-                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    bool terminal = clone_state->IsTerminal();
+                    open_spiel::Player pid = cur_node->player_id < 0
+                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                        : cur_node->player_id;
+                    if (!terminal) {
+                        batch_obs.push_back(clone_state->ObservationTensor());
+                        live_indices.push_back((int)outcome_states.size());
+                    }
+                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
+                }
+
+                std::vector<EvaluatorResult> batch_results;
+                if (!batch_obs.empty()) {
+                    batch_results = evaluator->evaluate_batch(batch_obs);
+                }
+
+                float expected_value = 0.0f;
+                int live_idx = 0;
+                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                    auto& os = outcome_states[oi];
+                    if (os.is_terminal) {
+                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
                     } else {
-                        std::vector<float> obs_vec = clone_state->ObservationTensor();
-                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                        float v = res.value;
-                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
-                            v = -v;
-                        }
-                        expected_value += outcome.second * v;
+                        float v = batch_results[live_idx].value;
+                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
+                        expected_value += os.prob * v;
+                        live_idx++;
                     }
                 }
                 value = expected_value;
@@ -1055,26 +1132,52 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
             // [Core Modification] Omniscient Expectation vs. Baseline single-sample
             if (chance_aware && sim_state->IsChanceNode()) {
-                // [Experimental] Fully expand all dice outcomes and compute \E[v]
-                float expected_value = 0.0f;
+                // [Optimized] Batch-evaluate all dice outcomes simultaneously.
                 auto outcomes = sim_state->ChanceOutcomes();
+
+                struct OutcomeState {
+                    float prob;
+                    std::unique_ptr<open_spiel::State> state;
+                    bool is_terminal;
+                    open_spiel::Player pid;
+                };
+                std::vector<OutcomeState> outcome_states;
+                outcome_states.reserve(outcomes.size());
+
+                std::vector<std::vector<float>> batch_obs;
+                std::vector<int> live_indices;
+
                 for (const auto& outcome : outcomes) {
                     auto clone_state = sim_state->Clone();
                     clone_state->ApplyAction(outcome.first);
                     advance_chance_nodes(clone_state.get(), nullptr);
-                    if (clone_state->IsTerminal()) {
-                        open_spiel::Player pid = cur_node->player_id < 0
-                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                            : cur_node->player_id;
-                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    bool terminal = clone_state->IsTerminal();
+                    open_spiel::Player pid = cur_node->player_id < 0
+                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                        : cur_node->player_id;
+                    if (!terminal) {
+                        batch_obs.push_back(clone_state->ObservationTensor());
+                        live_indices.push_back((int)outcome_states.size());
+                    }
+                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
+                }
+
+                std::vector<EvaluatorResult> batch_results;
+                if (!batch_obs.empty()) {
+                    batch_results = evaluator->evaluate_batch(batch_obs);
+                }
+
+                float expected_value = 0.0f;
+                int live_idx = 0;
+                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                    auto& os = outcome_states[oi];
+                    if (os.is_terminal) {
+                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
                     } else {
-                        std::vector<float> obs_vec = clone_state->ObservationTensor();
-                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                        float v = res.value;
-                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
-                            v = -v;
-                        }
-                        expected_value += outcome.second * v;
+                        float v = batch_results[live_idx].value;
+                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
+                        expected_value += os.prob * v;
+                        live_idx++;
                     }
                 }
                 value = expected_value;
@@ -1123,26 +1226,52 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
             // [Core Modification] Omniscient Expectation vs. Baseline single-sample
             if (chance_aware && cur_state->IsChanceNode()) {
-                // [Experimental] Fully expand all dice outcomes and compute \E[v]
-                float expected_value = 0.0f;
+                // [Optimized] Batch-evaluate all dice outcomes simultaneously.
                 auto outcomes = cur_state->ChanceOutcomes();
+
+                struct OutcomeState {
+                    float prob;
+                    std::unique_ptr<open_spiel::State> state;
+                    bool is_terminal;
+                    open_spiel::Player pid;
+                };
+                std::vector<OutcomeState> outcome_states;
+                outcome_states.reserve(outcomes.size());
+
+                std::vector<std::vector<float>> batch_obs;
+                std::vector<int> live_indices;
+
                 for (const auto& outcome : outcomes) {
                     auto clone_state = cur_state->Clone();
                     clone_state->ApplyAction(outcome.first);
                     advance_chance_nodes(clone_state.get(), nullptr);
-                    if (clone_state->IsTerminal()) {
-                        open_spiel::Player pid = cur_node->player_id < 0
-                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                            : cur_node->player_id;
-                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    bool terminal = clone_state->IsTerminal();
+                    open_spiel::Player pid = cur_node->player_id < 0
+                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                        : cur_node->player_id;
+                    if (!terminal) {
+                        batch_obs.push_back(clone_state->ObservationTensor());
+                        live_indices.push_back((int)outcome_states.size());
+                    }
+                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
+                }
+
+                std::vector<EvaluatorResult> batch_results;
+                if (!batch_obs.empty()) {
+                    batch_results = evaluator->evaluate_batch(batch_obs);
+                }
+
+                float expected_value = 0.0f;
+                int live_idx = 0;
+                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+                    auto& os = outcome_states[oi];
+                    if (os.is_terminal) {
+                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
                     } else {
-                        std::vector<float> obs_vec = clone_state->ObservationTensor();
-                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                        float v = res.value;
-                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
-                            v = -v;
-                        }
-                        expected_value += outcome.second * v;
+                        float v = batch_results[live_idx].value;
+                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
+                        expected_value += os.prob * v;
+                        live_idx++;
                     }
                 }
                 value = expected_value;
