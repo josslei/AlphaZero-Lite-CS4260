@@ -255,8 +255,22 @@ void SelfPlayEngine::expand_node(Node *node, const open_spiel::State& state, con
 // Returns the probability-weighted expected value (E[V]) across all outcomes.
 float SelfPlayEngine::expand_chance_node(Node *node, open_spiel::State& state)
 {
-    // node must be a chance node that has NOT yet been expanded.
+    // Safety: must be called on an actual game chance node.
+    if (!state.IsChanceNode()) {
+        // Silently fall back to a single-sample player-node evaluation.
+        std::vector<float> obs_vec = state.ObservationTensor();
+        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+        expand_node(node, state, res.policy);
+        node->node_type = NodeType::PLAYER;
+        node->player_id = state.CurrentPlayer();
+        return res.value;
+    }
     auto outcomes = state.ChanceOutcomes();
+    if (outcomes.empty()) {
+        // Degenerate: no outcomes — treat as terminal with 0 value.
+        node->is_expanded = true;
+        return 0.0f;
+    }
 
     // --- Phase 1: advance each outcome clone past any subsequent chance nodes ---
     struct OutcomeState {
@@ -385,6 +399,10 @@ std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *no
 // (the objective outcome probabilities set during expand_chance_node).
 std::pair<open_spiel::Action, Node *> SelfPlayEngine::sample_chance_child(Node *node)
 {
+    if (node->children.empty()) {
+        // Degenerate: should never happen after expand_chance_node.
+        return {open_spiel::kInvalidAction, nullptr};
+    }
     float r = dist(rng);
     float cumulative = 0.0f;
     open_spiel::Action sampled_action = node->children.begin()->first;
@@ -497,6 +515,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 if (cur_node->node_type == NodeType::CHANCE) {
                     // Chance node: sample one child by outcome probability.
                     auto [action, child] = sample_chance_child(cur_node);
+                    if (action == open_spiel::kInvalidAction || child == nullptr) break; // empty guard
                     // Apply the sampled dice action to the sim state.
                     action_path.push_back({sim_state->CurrentPlayer(), action});
                     sim_state->ApplyAction(action);
@@ -591,6 +610,7 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 if (cur_node->node_type == NodeType::CHANCE) {
                     // Chance node: sample one child by outcome probability.
                     auto [action, child] = sample_chance_child(cur_node);
+                    if (action == open_spiel::kInvalidAction || child == nullptr) break; // empty guard
                     cur_state->ApplyAction(action);
                     cur_node = child;
                     // Advance past any subsequent chain-chance nodes.
@@ -784,14 +804,62 @@ void SelfPlayEngine::play_game(const std::string& game_name, std::vector<std::ve
         trajectory.push_back(step);
 
         state->ApplyAction(best_action);
-        advance_chance_nodes(state.get(), nullptr);
 
-        if (root->children.count(best_action)) {
+        // [Fix C] Tree carry-over for chance_aware mode.
+        // After a player move the game transitions to a CHANCE node (dice roll).
+        // The MCTS tree records this as a CHANCE-typed child of root. If we naively
+        // hand that CHANCE node to the next run_mcts call as the new root, run_mcts
+        // would override node_type=PLAYER and then call select_best_child with
+        // player-move actions against a map keyed by dice-outcome integers — causing
+        // action=-1 to be applied on a chance state -> "Bad dice value: -1" crash.
+        //
+        // Correct behaviour: sample the dice roll ourselves (consistent with the tree),
+        // apply it to the game state, then carry the tree down to the matching PLAYER
+        // grandchild so that run_mcts always receives a PLAYER-rooted tree.
+        if (chance_aware && root->children.count(best_action)) {
+            std::unique_ptr<Node> chance_child = std::move(root->children[best_action]);
+            chance_child->parent = nullptr;
+
+            if (state->IsChanceNode()
+                && chance_child->node_type == NodeType::CHANCE
+                && chance_child->is_expanded
+                && !chance_child->children.empty()) {
+                // Sample a dice outcome that exists in the tree.
+                auto [dice_action, player_child] = [&]() {
+                    auto outcomes = state->ChanceOutcomes();
+                    float r_d = dist(rng), cum_d = 0.0f;
+                    open_spiel::Action da = outcomes.empty() ? chance_child->children.begin()->first : outcomes[0].first;
+                    for (auto& o : outcomes) { cum_d += o.second; if (r_d <= cum_d) { da = o.first; break; } }
+                    // Walk the tree with this dice action (fall back to begin if missing).
+                    Node* pc = chance_child->children.count(da)
+                               ? chance_child->children[da].get()
+                               : chance_child->children.begin()->second.get();
+                    if (!chance_child->children.count(da)) da = chance_child->children.begin()->first;
+                    return std::make_pair(da, pc);
+                }();
+                state->ApplyAction(dice_action);
+                advance_chance_nodes(state.get(), nullptr); // sub-chance after dice
+
+                if (chance_child->children.count(dice_action)) {
+                    root = std::move(chance_child->children[dice_action]);
+                    root->parent = nullptr;
+                } else {
+                    root = std::make_unique<Node>(nullptr, 1.0f);
+                }
+                (void)player_child; // ownership already transferred above
+            } else {
+                // Chance child not yet expanded or already a player node — just advance.
+                advance_chance_nodes(state.get(), nullptr);
+                root = std::move(chance_child);
+            }
+        } else if (root->children.count(best_action)) {
             std::unique_ptr<Node> next_root = std::move(root->children[best_action]);
             next_root->parent = nullptr;
             root = std::move(next_root);
+            advance_chance_nodes(state.get(), nullptr);
         } else {
             root = std::make_unique<Node>(nullptr, 1.0f);
+            advance_chance_nodes(state.get(), nullptr);
         }
     }
 
@@ -1128,7 +1196,19 @@ void TournamentEngine::expand_node(Node *node, const open_spiel::State& state, c
 // nodes, each evaluated and expanded with their own NN policy (Fix 2: no policy merging).
 float TournamentEngine::expand_chance_node(Node *node, open_spiel::State& state)
 {
+    if (!state.IsChanceNode()) {
+        std::vector<float> obs_vec = state.ObservationTensor();
+        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+        expand_node(node, state, res.policy);
+        node->node_type = NodeType::PLAYER;
+        node->player_id = state.CurrentPlayer();
+        return res.value;
+    }
     auto outcomes = state.ChanceOutcomes();
+    if (outcomes.empty()) {
+        node->is_expanded = true;
+        return 0.0f;
+    }
 
     struct OutcomeState {
         float prob;
@@ -1230,6 +1310,9 @@ std::pair<open_spiel::Action, Node *> TournamentEngine::select_best_child(Node *
 // [Fix 4] Sample a child of a CHANCE node proportional to outcome probabilities.
 std::pair<open_spiel::Action, Node *> TournamentEngine::sample_chance_child(Node *node)
 {
+    if (node->children.empty()) {
+        return {open_spiel::kInvalidAction, nullptr};
+    }
     float r = dist(rng);
     float cumulative = 0.0f;
     open_spiel::Action sampled_action = node->children.begin()->first;
@@ -1322,6 +1405,7 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
                 if (cur_node->node_type == NodeType::CHANCE) {
                     auto [action, child] = sample_chance_child(cur_node);
+                    if (action == open_spiel::kInvalidAction || child == nullptr) break; // empty guard
                     action_path.push_back({sim_state->CurrentPlayer(), action});
                     sim_state->ApplyAction(action);
                     cur_node = child;
@@ -1396,6 +1480,7 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
                 if (cur_node->node_type == NodeType::CHANCE) {
                     auto [action, child] = sample_chance_child(cur_node);
+                    if (action == open_spiel::kInvalidAction || child == nullptr) break; // empty guard
                     cur_state->ApplyAction(action);
                     cur_node = child;
                     while (cur_state->IsChanceNode() && !cur_state->IsTerminal()) {
