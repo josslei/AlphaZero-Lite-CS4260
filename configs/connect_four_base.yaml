@@ -75,7 +75,7 @@ evaluation:
     #   depth: 3
 
 full_tournament:
-  enabled: true             # Set to true to activate
+  enabled: false            # Set to true to activate
   interval: 25              # Run every N epochs
   num_games: 100            # Games per opponent (higher = more statistical confidence)
   num_threads: 100           # Worker threads (auto-capped to num_games)

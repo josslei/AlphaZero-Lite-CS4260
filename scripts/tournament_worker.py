@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--model_path", type=str, required=True,  help="Path to TorchScript .pt model")
     parser.add_argument("--config",     type=str, required=True,  help="Path to YAML config")
     parser.add_argument("--log_dir",    type=str, required=True,  help="TensorBoard log directory")
-    parser.add_argument("--epoch",      type=int, required=True,  help="Current training epoch (for TB step)")
+    parser.add_argument("--epoch",      type=int, required=False, default=-1, help="Evaluation identifier or final epoch (for TB step)")
     parser.add_argument("--device",     type=str, default="cuda", choices=["cuda", "cpu"],
                         help="Device for the tournament engine (cuda or cpu)")
     args = parser.parse_args()
