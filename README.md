@@ -12,6 +12,17 @@ A modular, high-performance implementation of the AlphaZero algorithm for board 
 
 ## 🛠 Setup & Installation
 
+### 0. Clone the Repository
+Ensure you clone the repository with submodules to include **OpenSpiel**:
+
+```bash
+git clone --recursive https://github.com/josslei/AlphaZero-Lite-CS4260.git
+cd AlphaZero-Lite-CS4260
+
+# If you already cloned the repo without submodules, run:
+git submodule update --init --recursive
+```
+
 ### 1. Environment Setup
 We recommend using [Conda](https://docs.conda.io/en/latest/) for dependency management:
 
