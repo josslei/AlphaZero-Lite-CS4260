@@ -11,7 +11,7 @@ model:
 
 mcts:
   # Search parameters
-  num_threads: 128
+  num_threads: 256
   batch_size: 64
   temperature: 1.0
   c_puct: 1.0
@@ -22,12 +22,12 @@ mcts:
 
   # Iteration Schedule: [start_epoch, num_iters]
   schedule:
-    - [ 0, 25 ]
-    - [ 5, 100 ]
-    - [ 20, 400 ]
+    - [ 0, 100 ]
+    - [ 5, 200 ]
+    - [ 30, 400 ]
 
   # Workload parameters
-  num_games_per_epoch: 128
+  num_games_per_epoch: 256
 
   # In-place ApplyAction/UndoAction (only for games that implement UndoAction)
   use_undo: false
@@ -43,8 +43,8 @@ training:
   learning_rate: 0.001
   weight_decay: 0.0001
   batch_size: 256
-  max_epochs: 50
-  replay_buffer_size: 50000
+  max_epochs: 100
+  replay_buffer_size: 100000
   num_workers: 4
 
 system:
@@ -56,7 +56,7 @@ system:
 evaluation:
   # Light Tournament: runs every 'interval' epochs vs Greedy only, fully in C++
   enabled: true
-  interval: 5
+  interval: 1
   num_games: 10  # configurable
   num_threads: 10  # capped to num_games automatically; no point exceeding it
   # opening_temp_moves: number of game plies where the model samples with temperature=1
@@ -66,7 +66,7 @@ evaluation:
   alphazero:
     type: "alphazero"
     engine: "cpp"
-    mcts_iters: 100
+    mcts_iters: 200
   opponents:
     - type: "greedy"
     # Full tournament opponents (use a separate FullTournamentCallback later):

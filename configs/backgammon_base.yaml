@@ -10,7 +10,7 @@ model:
 
 mcts:
   # Search parameters
-  num_threads: 128
+  num_threads: 256
   batch_size: 32
   temperature: 1.0
   c_puct: 1.0
@@ -26,12 +26,12 @@ mcts:
 
   # Iteration Schedule: [start_epoch, num_iters]
   schedule:
-    - [ 0, 25 ]
-    - [ 5, 50 ]
-    - [ 20, 100 ]
+    - [ 0, 50 ]
+    - [ 5, 100 ]
+    - [ 20, 200 ]
 
   # Workload parameters
-  num_games_per_epoch: 128
+  num_games_per_epoch: 256
 
   # In-place ApplyAction/UndoAction (backgammon natively supports it perfectly for open loop states)
   use_undo: true
@@ -47,7 +47,7 @@ training:
   learning_rate: 0.001
   weight_decay: 0.0001
   batch_size: 256
-  max_epochs: 50
+  max_epochs: 60
   replay_buffer_size: 500000
   num_workers: 4
 
@@ -60,17 +60,15 @@ system:
 evaluation:
   # Light Tournament: runs every 'interval' epochs vs Greedy only, fully in C++
   enabled: true
-  interval: 5
-  num_games: 6       # Backgammon games are ~280 moves long with a real greedy opponent;
-                     # 6 games gives a meaningful win-rate signal while staying fast.
-  num_threads: 6
+  interval: 10
+  num_games: 10
+  num_threads: 10
   # opening_temp_moves: number of game plies for opening diversity
-  opening_temp_moves: 2
+  opening_temp_moves: 0
   alphazero:
     type: "alphazero"
     engine: "cpp"
-    mcts_iters: 50   # Halved from 100 — MCTS quality doesn't scale linearly with iters when
-                     # the policy prior is reasonable; 50 is sufficient for evaluation.
+    mcts_iters: 200
   opponents:
     - type: "greedy"
     # Full tournament opponents:
