@@ -243,9 +243,111 @@ void SelfPlayEngine::expand_node(Node *node, const open_spiel::State& state, con
     {
         // Safety check to ensure action is within vector bounds
         float prob = (action >= 0 && action < static_cast<open_spiel::Action>(policy.size())) ? policy[action] : 0.0f;
-        node->children[action] = std::make_unique<Node>(node, prob);
+        // [Fix 1] Children of a PLAYER node are PLAYER nodes.
+        node->children[action] = std::make_unique<Node>(node, prob, NodeType::PLAYER);
     }
     node->is_expanded = true;
+}
+
+// [Fix 1/3B] Expand a CHANCE node by instantiating all outcome children as individual
+// PLAYER nodes, each independently evaluated by the neural network and expanded with
+// its own legal-action-specific policy distribution.
+// Returns the probability-weighted expected value (E[V]) across all outcomes.
+float SelfPlayEngine::expand_chance_node(Node *node, open_spiel::State& state)
+{
+    // node must be a chance node that has NOT yet been expanded.
+    auto outcomes = state.ChanceOutcomes();
+
+    // --- Phase 1: advance each outcome clone past any subsequent chance nodes ---
+    struct OutcomeState {
+        float prob;
+        open_spiel::Action dice_action;
+        std::unique_ptr<open_spiel::State> state;
+        bool is_terminal;
+        open_spiel::Player pid; // player to act (or who last acted if terminal)
+    };
+    std::vector<OutcomeState> outcome_states;
+    outcome_states.reserve(outcomes.size());
+
+    // Collect observations for all non-terminal outcome states in one pass
+    // so they can be submitted as a single GPU batch (Fix 3B efficiency).
+    std::vector<std::vector<float>> batch_obs;
+    std::vector<int> live_indices; // maps batch_obs[i] -> outcome_states[j]
+
+    for (const auto& outcome : outcomes) {
+        auto clone = state.Clone();
+        clone->ApplyAction(outcome.first);
+        // Advance past any immediately following chance nodes (e.g. second dice event).
+        while (clone->IsChanceNode() && !clone->IsTerminal()) {
+            auto sub_outcomes = clone->ChanceOutcomes();
+            float r = dist(rng);
+            float cum = 0.0f;
+            open_spiel::Action sa = sub_outcomes[0].first;
+            for (auto& so : sub_outcomes) {
+                cum += so.second;
+                if (r <= cum) { sa = so.first; break; }
+            }
+            clone->ApplyAction(sa);
+        }
+        bool terminal = clone->IsTerminal();
+        open_spiel::Player pid = terminal
+            ? (node->player_id >= 0 ? node->player_id : 0)
+            : clone->CurrentPlayer();
+        if (!terminal) {
+            batch_obs.push_back(clone->ObservationTensor());
+            live_indices.push_back((int)outcome_states.size());
+        }
+        outcome_states.push_back({static_cast<float>(outcome.second),
+                                   outcome.first,
+                                   std::move(clone), terminal, pid});
+    }
+
+    // --- Phase 2: batch NN evaluation for all live outcome states ---
+    std::vector<EvaluatorResult> batch_results;
+    if (!batch_obs.empty()) {
+        batch_results = evaluator->evaluate_batch(batch_obs);
+    }
+
+    // --- Phase 3: create children under the chance node; expand each live child
+    //              with its own independent policy (Fix 2: NO policy merging). ---
+    float expected_value = 0.0f;
+    int live_idx = 0;
+
+    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+        auto& os = outcome_states[oi];
+
+        // [Fix 1] Create one child per dice outcome. The child is keyed by the dice
+        // action; its prior_prob equals the objective probability of that outcome.
+        // The child is a PLAYER node (or a terminal proxy).
+        auto child_node = std::make_unique<Node>(node, os.prob, NodeType::PLAYER);
+        child_node->player_id = os.pid;
+
+        if (os.is_terminal) {
+            float ret = os.state->PlayerReturn(os.pid);
+            // Flip sign if this outcome is from the opposing player's perspective.
+            float v = (node->player_id >= 0 && os.pid != node->player_id) ? -ret : ret;
+            expected_value += os.prob * v;
+            // Terminal child: mark expanded so the selection loop terminates.
+            child_node->is_expanded = true;
+        } else {
+            const auto& res = batch_results[live_idx];
+            // [Fix 2] Each outcome state gets its own independent policy —
+            // never merged/averaged across different dice rolls.
+            expand_node(child_node.get(), *os.state, res.policy);
+            child_node->player_id = os.pid;
+
+            float v = res.value;
+            // Negate if the outcome state is an opponent node relative to the chance node parent.
+            if (node->player_id >= 0 && os.pid != node->player_id) v = -v;
+            expected_value += os.prob * v;
+            ++live_idx;
+        }
+
+        node->children[os.dice_action] = std::move(child_node);
+    }
+
+    node->is_expanded = true;
+    return expected_value;
 }
 
 std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions)
@@ -259,7 +361,7 @@ std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *no
     for (open_spiel::Action action : legal_actions)
     {
         if (!node->children.count(action)) {
-            node->children[action] = std::make_unique<Node>(node, 1.0f / std::max(1, (int)legal_actions.size()));
+            node->children[action] = std::make_unique<Node>(node, 1.0f / std::max(1, (int)legal_actions.size()), NodeType::PLAYER);
         }
 
         Node *child = node->children[action].get();
@@ -279,6 +381,25 @@ std::pair<open_spiel::Action, Node *> SelfPlayEngine::select_best_child(Node *no
     return {best_action, best_child};
 }
 
+// [Fix 4] For CHANCE nodes: select one child by sampling proportionally to prior_prob
+// (the objective outcome probabilities set during expand_chance_node).
+std::pair<open_spiel::Action, Node *> SelfPlayEngine::sample_chance_child(Node *node)
+{
+    float r = dist(rng);
+    float cumulative = 0.0f;
+    open_spiel::Action sampled_action = node->children.begin()->first;
+    Node *sampled_child = node->children.begin()->second.get();
+    for (auto& [action, child] : node->children) {
+        cumulative += child->prior_prob;
+        if (r <= cumulative) {
+            sampled_action = action;
+            sampled_child = child.get();
+            break;
+        }
+    }
+    return {sampled_action, sampled_child};
+}
+
 void SelfPlayEngine::backpropagate(Node *node, float value)
 {
     Node *cur = node;
@@ -288,8 +409,12 @@ void SelfPlayEngine::backpropagate(Node *node, float value)
         cur->total_value += value;
         cur->mean_value = cur->total_value / cur->visit_count;
 
-        // [Fix Issue 3]: Conditional Negation
-        if (cur->parent != nullptr && cur->parent->player_id != cur->player_id)
+        // [Fix Issue 3]: Conditional Negation — skip sign flip at CHANCE nodes
+        // since they don't belong to either player.
+        if (cur->parent != nullptr
+            && cur->node_type == NodeType::PLAYER
+            && cur->parent->node_type == NodeType::PLAYER
+            && cur->parent->player_id != cur->player_id)
         {
             value = -value;
         }
@@ -300,6 +425,9 @@ void SelfPlayEngine::backpropagate(Node *node, float value)
 
 void SelfPlayEngine::advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path)
 {
+    // Used only in the non-chance_aware (baseline) path to fast-forward through
+    // chance nodes by random sampling. In chance_aware mode, chance nodes are
+    // explicitly represented in the tree via expand_chance_node.
     while (state->IsChanceNode() && !state->IsTerminal()) {
         auto outcomes = state->ChanceOutcomes();
         
@@ -329,8 +457,9 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
         sim_state = current_state.Clone();
     }
 
-    // [NEW]: Ensure root has the current player_id
+    // Ensure root has the current player_id
     root->player_id = current_state.CurrentPlayer();
+    root->node_type = NodeType::PLAYER;
 
     for (int i = 0; i < num_iters; ++i)
     {
@@ -347,8 +476,6 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                     second_v = child->visit_count;
                 }
             }
-            // If condition met: even if all remaining simulations go to the runner-up,
-            // the current winner will still have more visits.
             if (max_v > second_v + (num_iters - i)) {
                 metrics->iters_saved += (num_iters - i);
                 break;
@@ -362,117 +489,76 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
             // Undo-based path: apply actions in-place, track path for reversal
             std::vector<std::pair<open_spiel::Player, open_spiel::Action>> action_path;
 
-            // Selection
+            // [Fix 4] Selection: PLAYER nodes use PUCT; CHANCE nodes use probability sampling.
             while (cur_node->is_expanded)
             {
                 current_depth++;
-                advance_chance_nodes(sim_state.get(), &action_path);
-                if (sim_state->IsTerminal()) break;
-                
-                open_spiel::Player current_p = sim_state->CurrentPlayer();
-                auto best = select_best_child(cur_node, sim_state->LegalActions());
-                sim_state->ApplyAction(best.first);
-                action_path.push_back({current_p, best.first});
-                
-                cur_node = best.second;
-                // Synchronize player ID securely
-                if (!sim_state->IsTerminal()) {
-                    cur_node->player_id = sim_state->CurrentPlayer();
+
+                if (cur_node->node_type == NodeType::CHANCE) {
+                    // Chance node: sample one child by outcome probability.
+                    auto [action, child] = sample_chance_child(cur_node);
+                    // Apply the sampled dice action to the sim state.
+                    action_path.push_back({sim_state->CurrentPlayer(), action});
+                    sim_state->ApplyAction(action);
+                    cur_node = child;
+                    // Advance past any subsequent chain-chance nodes in undo mode.
+                    while (sim_state->IsChanceNode() && !sim_state->IsTerminal()) {
+                        auto sub_outcomes = sim_state->ChanceOutcomes();
+                        float r2 = dist(rng); float cum2 = 0.0f;
+                        open_spiel::Action sa2 = sub_outcomes[0].first;
+                        for (auto& so : sub_outcomes) { cum2 += so.second; if (r2 <= cum2) { sa2 = so.first; break; } }
+                        action_path.push_back({sim_state->CurrentPlayer(), sa2});
+                        sim_state->ApplyAction(sa2);
+                    }
                 } else {
-                    cur_node->player_id = current_p; // Maintain alignment for terminal
+                    // Player node: advance past any game-level chance nodes first.
+                    if (!chance_aware) {
+                        advance_chance_nodes(sim_state.get(), &action_path);
+                    }
+                    if (sim_state->IsTerminal()) break;
+
+                    open_spiel::Player current_p = sim_state->CurrentPlayer();
+                    auto best = select_best_child(cur_node, sim_state->LegalActions());
+                    sim_state->ApplyAction(best.first);
+                    action_path.push_back({current_p, best.first});
+                    cur_node = best.second;
+
+                    if (!sim_state->IsTerminal()) {
+                        // [Fix 1] If the next state is a chance node and chance_aware is on,
+                        // the next tree node should be a CHANCE node.
+                        if (chance_aware && sim_state->IsChanceNode()) {
+                            cur_node->node_type = NodeType::CHANCE;
+                            cur_node->player_id = current_p; // inherit last player
+                        } else {
+                            cur_node->node_type = NodeType::PLAYER;
+                            cur_node->player_id = sim_state->CurrentPlayer();
+                        }
+                    } else {
+                        cur_node->player_id = current_p;
+                    }
                 }
+
+                if (sim_state->IsTerminal()) break;
             }
+
             // Evaluation & Expansion
             float value = 0.0f;
 
-            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
-            if (chance_aware && sim_state->IsChanceNode()) {
-                // [Optimized] Batch-evaluate all dice outcomes simultaneously so the
-                // GPU can process them in a single pass instead of N serial round-trips.
-                auto outcomes = sim_state->ChanceOutcomes();
-
-                // Phase 1: advance each outcome's clone and separate terminal vs. live states
-                struct OutcomeState {
-                    float prob;
-                    std::unique_ptr<open_spiel::State> state;
-                    bool is_terminal;
-                    open_spiel::Player pid; // only valid when is_terminal
-                };
-                std::vector<OutcomeState> outcome_states;
-                outcome_states.reserve(outcomes.size());
-
-                std::vector<std::vector<float>> batch_obs;  // observations for live states
-                std::vector<int> live_indices;              // maps batch_obs[i] -> outcome_states[j]
-
-                for (const auto& outcome : outcomes) {
-                    auto clone_state = sim_state->Clone();
-                    clone_state->ApplyAction(outcome.first);
-                    advance_chance_nodes(clone_state.get(), nullptr);
-                    bool terminal = clone_state->IsTerminal();
-                    open_spiel::Player pid = cur_node->player_id < 0
-                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                        : cur_node->player_id;
-                    if (!terminal) {
-                        batch_obs.push_back(clone_state->ObservationTensor());
-                        live_indices.push_back((int)outcome_states.size());
-                    }
-                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
+            if (sim_state->IsTerminal()) {
+                if (cur_node->player_id < 0) {
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
                 }
-
-                // Phase 2: single batched NN call for all live states
-                std::vector<EvaluatorResult> batch_results;
-                if (!batch_obs.empty()) {
-                    batch_results = evaluator->evaluate_batch(batch_obs);
-                }
-
-                // Phase 3: combine terminal returns and NN values into E[v],
-                // and accumulate an expected policy for node expansion.
-                float expected_value = 0.0f;
-                // expected_policy[action] = sum_over_rolls( prob * policy[action] )
-                // We build this over the full action-space size from the first live result.
-                std::vector<float> expected_policy;
-                int policy_size = 0;
-                if (!batch_results.empty()) {
-                    policy_size = (int)batch_results[0].policy.size();
-                    expected_policy.resize(policy_size, 0.0f);
-                }
-
-                int live_idx = 0;
-                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                    auto& os = outcome_states[oi];
-                    if (os.is_terminal) {
-                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
-                    } else {
-                        float v = batch_results[live_idx].value;
-                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
-                        expected_value += os.prob * v;
-                        // Accumulate weighted policy
-                        const auto& pol = batch_results[live_idx].policy;
-                        for (int a = 0; a < policy_size; ++a) {
-                            expected_policy[a] += os.prob * pol[a];
-                        }
-                        live_idx++;
-                    }
-                }
-                value = expected_value;
-
-                // Expand once: use the expected policy as priors so MCTS can descend
-                // past this chance node in subsequent iterations without re-evaluating.
-                // Use the first live outcome's post-roll state to get a concrete legal
-                // action set (actions available under at least one dice roll).
-                if (!cur_node->is_expanded && !expected_policy.empty()) {
-                    // Find first live outcome to get legal actions
-                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                        if (!outcome_states[oi].is_terminal) {
-                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
-                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
-                            break;
-                        }
-                    }
-                }
+                value = sim_state->PlayerReturn(cur_node->player_id);
+            } else if (chance_aware && (sim_state->IsChanceNode() || cur_node->node_type == NodeType::CHANCE)) {
+                // [Fix 1/3B] Expand the chance node with all 21 outcomes; get E[V].
+                cur_node->node_type = NodeType::CHANCE;
+                cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                value = expand_chance_node(cur_node, *sim_state);
             } else {
-                // [Baseline] Original blind single-sample logic (use_undo branch)
-                advance_chance_nodes(sim_state.get(), &action_path);
+                // Standard player node expansion.
+                if (!chance_aware) {
+                    advance_chance_nodes(sim_state.get(), &action_path);
+                }
                 if (sim_state->IsTerminal()) {
                     if (cur_node->player_id < 0) {
                         cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
@@ -494,105 +580,74 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                 sim_state->UndoAction(it->first, it->second);
             }
         } else {
-            // Clone-based path (original behavior)
+            // Clone-based path
             std::unique_ptr<open_spiel::State> cur_state = current_state.Clone();
 
-            // Selection
+            // [Fix 4] Selection: PLAYER nodes use PUCT; CHANCE nodes use probability sampling.
             while (cur_node->is_expanded)
             {
                 current_depth++;
-                advance_chance_nodes(cur_state.get(), nullptr);
-                if (cur_state->IsTerminal()) break;
-                
-                open_spiel::Player current_p = cur_state->CurrentPlayer();
-                auto best = select_best_child(cur_node, cur_state->LegalActions());
-                cur_state->ApplyAction(best.first);
-                
-                cur_node = best.second;
-                if (!cur_state->IsTerminal()) {
-                    cur_node->player_id = cur_state->CurrentPlayer();
+
+                if (cur_node->node_type == NodeType::CHANCE) {
+                    // Chance node: sample one child by outcome probability.
+                    auto [action, child] = sample_chance_child(cur_node);
+                    cur_state->ApplyAction(action);
+                    cur_node = child;
+                    // Advance past any subsequent chain-chance nodes.
+                    while (cur_state->IsChanceNode() && !cur_state->IsTerminal()) {
+                        auto sub_outcomes = cur_state->ChanceOutcomes();
+                        float r2 = dist(rng); float cum2 = 0.0f;
+                        open_spiel::Action sa2 = sub_outcomes[0].first;
+                        for (auto& so : sub_outcomes) { cum2 += so.second; if (r2 <= cum2) { sa2 = so.first; break; } }
+                        cur_state->ApplyAction(sa2);
+                    }
                 } else {
-                    cur_node->player_id = current_p;
+                    // Player node: advance past any game-level chance nodes first.
+                    if (!chance_aware) {
+                        advance_chance_nodes(cur_state.get(), nullptr);
+                    }
+                    if (cur_state->IsTerminal()) break;
+
+                    open_spiel::Player current_p = cur_state->CurrentPlayer();
+                    auto best = select_best_child(cur_node, cur_state->LegalActions());
+                    cur_state->ApplyAction(best.first);
+                    cur_node = best.second;
+
+                    if (!cur_state->IsTerminal()) {
+                        // [Fix 1] Tag the next node as CHANCE if the game is now in a chance state.
+                        if (chance_aware && cur_state->IsChanceNode()) {
+                            cur_node->node_type = NodeType::CHANCE;
+                            cur_node->player_id = current_p;
+                        } else {
+                            cur_node->node_type = NodeType::PLAYER;
+                            cur_node->player_id = cur_state->CurrentPlayer();
+                        }
+                    } else {
+                        cur_node->player_id = current_p;
+                    }
                 }
+
+                if (cur_state->IsTerminal()) break;
             }
+
             // Evaluation & Expansion
             float value = 0.0f;
 
-            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
-            if (chance_aware && cur_state->IsChanceNode()) {
-                // [Optimized] Batch-evaluate all dice outcomes simultaneously.
-                auto outcomes = cur_state->ChanceOutcomes();
-
-                struct OutcomeState {
-                    float prob;
-                    std::unique_ptr<open_spiel::State> state;
-                    bool is_terminal;
-                    open_spiel::Player pid;
-                };
-                std::vector<OutcomeState> outcome_states;
-                outcome_states.reserve(outcomes.size());
-
-                std::vector<std::vector<float>> batch_obs;
-                std::vector<int> live_indices;
-
-                for (const auto& outcome : outcomes) {
-                    auto clone_state = cur_state->Clone();
-                    clone_state->ApplyAction(outcome.first);
-                    advance_chance_nodes(clone_state.get(), nullptr);
-                    bool terminal = clone_state->IsTerminal();
-                    open_spiel::Player pid = cur_node->player_id < 0
-                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                        : cur_node->player_id;
-                    if (!terminal) {
-                        batch_obs.push_back(clone_state->ObservationTensor());
-                        live_indices.push_back((int)outcome_states.size());
-                    }
-                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
+            if (cur_state->IsTerminal()) {
+                if (cur_node->player_id < 0) {
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
                 }
-
-                std::vector<EvaluatorResult> batch_results;
-                if (!batch_obs.empty()) {
-                    batch_results = evaluator->evaluate_batch(batch_obs);
-                }
-
-                float expected_value = 0.0f;
-                std::vector<float> expected_policy;
-                int policy_size = 0;
-                if (!batch_results.empty()) {
-                    policy_size = (int)batch_results[0].policy.size();
-                    expected_policy.resize(policy_size, 0.0f);
-                }
-
-                int live_idx = 0;
-                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                    auto& os = outcome_states[oi];
-                    if (os.is_terminal) {
-                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
-                    } else {
-                        float v = batch_results[live_idx].value;
-                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
-                        expected_value += os.prob * v;
-                        const auto& pol = batch_results[live_idx].policy;
-                        for (int a = 0; a < policy_size; ++a) {
-                            expected_policy[a] += os.prob * pol[a];
-                        }
-                        live_idx++;
-                    }
-                }
-                value = expected_value;
-
-                if (!cur_node->is_expanded && !expected_policy.empty()) {
-                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                        if (!outcome_states[oi].is_terminal) {
-                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
-                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
-                            break;
-                        }
-                    }
-                }
+                value = cur_state->PlayerReturn(cur_node->player_id);
+            } else if (chance_aware && (cur_state->IsChanceNode() || cur_node->node_type == NodeType::CHANCE)) {
+                // [Fix 1/3B] Expand all 21 outcome children independently.
+                cur_node->node_type = NodeType::CHANCE;
+                cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                value = expand_chance_node(cur_node, *cur_state);
             } else {
-                // [Baseline] Original blind single-sample logic (clone branch)
-                advance_chance_nodes(cur_state.get(), nullptr);
+                // Standard player node expansion.
+                if (!chance_aware) {
+                    advance_chance_nodes(cur_state.get(), nullptr);
+                }
                 if (cur_state->IsTerminal()) {
                     if (cur_node->player_id < 0) {
                         cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
@@ -1063,9 +1118,87 @@ void TournamentEngine::expand_node(Node *node, const open_spiel::State& state, c
     std::vector<open_spiel::Action> legal_actions = state.LegalActions();
     for (open_spiel::Action action : legal_actions) {
         float prob = (action >= 0 && action < static_cast<open_spiel::Action>(policy.size())) ? policy[action] : 0.0f;
-        node->children[action] = std::make_unique<Node>(node, prob);
+        // [Fix 1] Children of a PLAYER node are PLAYER nodes.
+        node->children[action] = std::make_unique<Node>(node, prob, NodeType::PLAYER);
     }
     node->is_expanded = true;
+}
+
+// [Fix 1/3B] Expand a CHANCE node: create all outcome children as independent PLAYER
+// nodes, each evaluated and expanded with their own NN policy (Fix 2: no policy merging).
+float TournamentEngine::expand_chance_node(Node *node, open_spiel::State& state)
+{
+    auto outcomes = state.ChanceOutcomes();
+
+    struct OutcomeState {
+        float prob;
+        open_spiel::Action dice_action;
+        std::unique_ptr<open_spiel::State> state;
+        bool is_terminal;
+        open_spiel::Player pid;
+    };
+    std::vector<OutcomeState> outcome_states;
+    outcome_states.reserve(outcomes.size());
+
+    std::vector<std::vector<float>> batch_obs;
+    std::vector<int> live_indices;
+
+    for (const auto& outcome : outcomes) {
+        auto clone = state.Clone();
+        clone->ApplyAction(outcome.first);
+        // Advance past any chained chance sub-events after the dice roll.
+        while (clone->IsChanceNode() && !clone->IsTerminal()) {
+            auto sub_outcomes = clone->ChanceOutcomes();
+            float r = dist(rng); float cum = 0.0f;
+            open_spiel::Action sa = sub_outcomes[0].first;
+            for (auto& so : sub_outcomes) { cum += so.second; if (r <= cum) { sa = so.first; break; } }
+            clone->ApplyAction(sa);
+        }
+        bool terminal = clone->IsTerminal();
+        open_spiel::Player pid = terminal
+            ? (node->player_id >= 0 ? node->player_id : 0)
+            : clone->CurrentPlayer();
+        if (!terminal) {
+            batch_obs.push_back(clone->ObservationTensor());
+            live_indices.push_back((int)outcome_states.size());
+        }
+        outcome_states.push_back({static_cast<float>(outcome.second), outcome.first,
+                                   std::move(clone), terminal, pid});
+    }
+
+    std::vector<EvaluatorResult> batch_results;
+    if (!batch_obs.empty()) {
+        batch_results = evaluator->evaluate_batch(batch_obs);
+    }
+
+    float expected_value = 0.0f;
+    int live_idx = 0;
+
+    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
+        auto& os = outcome_states[oi];
+        auto child_node = std::make_unique<Node>(node, os.prob, NodeType::PLAYER);
+        child_node->player_id = os.pid;
+
+        if (os.is_terminal) {
+            float ret = os.state->PlayerReturn(os.pid);
+            float v = (node->player_id >= 0 && os.pid != node->player_id) ? -ret : ret;
+            expected_value += os.prob * v;
+            child_node->is_expanded = true; // terminal proxy
+        } else {
+            const auto& res = batch_results[live_idx];
+            // [Fix 2] Independent policy per outcome — never merged.
+            expand_node(child_node.get(), *os.state, res.policy);
+            child_node->player_id = os.pid;
+            float v = res.value;
+            if (node->player_id >= 0 && os.pid != node->player_id) v = -v;
+            expected_value += os.prob * v;
+            ++live_idx;
+        }
+        node->children[os.dice_action] = std::move(child_node);
+    }
+
+    node->is_expanded = true;
+    return expected_value;
 }
 
 std::pair<open_spiel::Action, Node *> TournamentEngine::select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions)
@@ -1077,7 +1210,7 @@ std::pair<open_spiel::Action, Node *> TournamentEngine::select_best_child(Node *
 
     for (open_spiel::Action action : legal_actions) {
         if (!node->children.count(action)) {
-            node->children[action] = std::make_unique<Node>(node, 1.0f / std::max(1, (int)legal_actions.size()));
+            node->children[action] = std::make_unique<Node>(node, 1.0f / std::max(1, (int)legal_actions.size()), NodeType::PLAYER);
         }
 
         Node *child = node->children[action].get();
@@ -1094,6 +1227,24 @@ std::pair<open_spiel::Action, Node *> TournamentEngine::select_best_child(Node *
     return {best_action, best_child};
 }
 
+// [Fix 4] Sample a child of a CHANCE node proportional to outcome probabilities.
+std::pair<open_spiel::Action, Node *> TournamentEngine::sample_chance_child(Node *node)
+{
+    float r = dist(rng);
+    float cumulative = 0.0f;
+    open_spiel::Action sampled_action = node->children.begin()->first;
+    Node *sampled_child = node->children.begin()->second.get();
+    for (auto& [action, child] : node->children) {
+        cumulative += child->prior_prob;
+        if (r <= cumulative) {
+            sampled_action = action;
+            sampled_child = child.get();
+            break;
+        }
+    }
+    return {sampled_action, sampled_child};
+}
+
 void TournamentEngine::backpropagate(Node *node, float value)
 {
     Node *cur = node;
@@ -1101,7 +1252,11 @@ void TournamentEngine::backpropagate(Node *node, float value)
         cur->visit_count++;
         cur->total_value += value;
         cur->mean_value = cur->total_value / cur->visit_count;
-        if (cur->parent != nullptr && cur->parent->player_id != cur->player_id) {
+        // [Fix Issue 3] Skip sign flip at CHANCE nodes (they have no player perspective).
+        if (cur->parent != nullptr
+            && cur->node_type == NodeType::PLAYER
+            && cur->parent->node_type == NodeType::PLAYER
+            && cur->parent->player_id != cur->player_id) {
             value = -value;
         }
         cur = cur->parent;
@@ -1110,6 +1265,7 @@ void TournamentEngine::backpropagate(Node *node, float value)
 
 void TournamentEngine::advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path)
 {
+    // Used only in the non-chance_aware (baseline) path.
     while (state->IsChanceNode() && !state->IsTerminal()) {
         auto outcomes = state->ChanceOutcomes();
         float r = dist(rng);
@@ -1135,6 +1291,7 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
     }
 
     root->player_id = current_state.CurrentPlayer();
+    root->node_type = NodeType::PLAYER;
 
     for (int i = 0; i < num_iters; ++i) {
         if (i > num_iters / 2 && i % 16 == 0) {
@@ -1158,106 +1315,63 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
 
         if (use_undo) {
             std::vector<std::pair<open_spiel::Player, open_spiel::Action>> action_path;
-            
+
+            // [Fix 4] Selection: route by node type.
             while (cur_node->is_expanded) {
                 current_depth++;
-                advance_chance_nodes(sim_state.get(), &action_path);
-                if (sim_state->IsTerminal()) break;
-                
-                open_spiel::Player current_p = sim_state->CurrentPlayer();
-                auto best = select_best_child(cur_node, sim_state->LegalActions());
-                sim_state->ApplyAction(best.first);
-                action_path.push_back({current_p, best.first});
-                
-                cur_node = best.second;
-                if (!sim_state->IsTerminal()) {
-                    cur_node->player_id = sim_state->CurrentPlayer();
+
+                if (cur_node->node_type == NodeType::CHANCE) {
+                    auto [action, child] = sample_chance_child(cur_node);
+                    action_path.push_back({sim_state->CurrentPlayer(), action});
+                    sim_state->ApplyAction(action);
+                    cur_node = child;
+                    while (sim_state->IsChanceNode() && !sim_state->IsTerminal()) {
+                        auto sub_outcomes = sim_state->ChanceOutcomes();
+                        float r2 = dist(rng); float cum2 = 0.0f;
+                        open_spiel::Action sa2 = sub_outcomes[0].first;
+                        for (auto& so : sub_outcomes) { cum2 += so.second; if (r2 <= cum2) { sa2 = so.first; break; } }
+                        action_path.push_back({sim_state->CurrentPlayer(), sa2});
+                        sim_state->ApplyAction(sa2);
+                    }
                 } else {
-                    cur_node->player_id = current_p;
-                }
-            }
-            // Evaluation & Expansion
-            float value = 0.0f;
+                    if (!chance_aware) advance_chance_nodes(sim_state.get(), &action_path);
+                    if (sim_state->IsTerminal()) break;
 
-            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
-            if (chance_aware && sim_state->IsChanceNode()) {
-                // [Optimized] Batch-evaluate all dice outcomes simultaneously.
-                auto outcomes = sim_state->ChanceOutcomes();
+                    open_spiel::Player current_p = sim_state->CurrentPlayer();
+                    auto best = select_best_child(cur_node, sim_state->LegalActions());
+                    sim_state->ApplyAction(best.first);
+                    action_path.push_back({current_p, best.first});
+                    cur_node = best.second;
 
-                struct OutcomeState {
-                    float prob;
-                    std::unique_ptr<open_spiel::State> state;
-                    bool is_terminal;
-                    open_spiel::Player pid;
-                };
-                std::vector<OutcomeState> outcome_states;
-                outcome_states.reserve(outcomes.size());
-
-                std::vector<std::vector<float>> batch_obs;
-                std::vector<int> live_indices;
-
-                for (const auto& outcome : outcomes) {
-                    auto clone_state = sim_state->Clone();
-                    clone_state->ApplyAction(outcome.first);
-                    advance_chance_nodes(clone_state.get(), nullptr);
-                    bool terminal = clone_state->IsTerminal();
-                    open_spiel::Player pid = cur_node->player_id < 0
-                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                        : cur_node->player_id;
-                    if (!terminal) {
-                        batch_obs.push_back(clone_state->ObservationTensor());
-                        live_indices.push_back((int)outcome_states.size());
-                    }
-                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
-                }
-
-                std::vector<EvaluatorResult> batch_results;
-                if (!batch_obs.empty()) {
-                    batch_results = evaluator->evaluate_batch(batch_obs);
-                }
-
-                float expected_value = 0.0f;
-                std::vector<float> expected_policy;
-                int policy_size = 0;
-                if (!batch_results.empty()) {
-                    policy_size = (int)batch_results[0].policy.size();
-                    expected_policy.resize(policy_size, 0.0f);
-                }
-
-                int live_idx = 0;
-                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                    auto& os = outcome_states[oi];
-                    if (os.is_terminal) {
-                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
+                    if (!sim_state->IsTerminal()) {
+                        if (chance_aware && sim_state->IsChanceNode()) {
+                            cur_node->node_type = NodeType::CHANCE;
+                            cur_node->player_id = current_p;
+                        } else {
+                            cur_node->node_type = NodeType::PLAYER;
+                            cur_node->player_id = sim_state->CurrentPlayer();
+                        }
                     } else {
-                        float v = batch_results[live_idx].value;
-                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
-                        expected_value += os.prob * v;
-                        const auto& pol = batch_results[live_idx].policy;
-                        for (int a = 0; a < policy_size; ++a) {
-                            expected_policy[a] += os.prob * pol[a];
-                        }
-                        live_idx++;
+                        cur_node->player_id = current_p;
                     }
                 }
-                value = expected_value;
+                if (sim_state->IsTerminal()) break;
+            }
 
-                if (!cur_node->is_expanded && !expected_policy.empty()) {
-                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                        if (!outcome_states[oi].is_terminal) {
-                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
-                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
-                            break;
-                        }
-                    }
-                }
+            float value = 0.0f;
+            if (sim_state->IsTerminal()) {
+                if (cur_node->player_id < 0)
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                value = sim_state->PlayerReturn(cur_node->player_id);
+            } else if (chance_aware && (sim_state->IsChanceNode() || cur_node->node_type == NodeType::CHANCE)) {
+                cur_node->node_type = NodeType::CHANCE;
+                cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                value = expand_chance_node(cur_node, *sim_state);
             } else {
-                // [Baseline] Original blind single-sample logic (use_undo branch)
-                advance_chance_nodes(sim_state.get(), &action_path);
+                if (!chance_aware) advance_chance_nodes(sim_state.get(), &action_path);
                 if (sim_state->IsTerminal()) {
-                    if (cur_node->player_id < 0) {
+                    if (cur_node->player_id < 0)
                         cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
-                    }
                     value = sim_state->PlayerReturn(cur_node->player_id);
                 } else {
                     std::vector<float> obs_vec = sim_state->ObservationTensor();
@@ -1275,104 +1389,60 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
             }
         } else {
             std::unique_ptr<open_spiel::State> cur_state = current_state.Clone();
+
+            // [Fix 4] Selection: route by node type.
             while (cur_node->is_expanded) {
                 current_depth++;
-                advance_chance_nodes(cur_state.get(), nullptr);
-                if (cur_state->IsTerminal()) break;
-                
-                open_spiel::Player current_p = cur_state->CurrentPlayer();
-                auto best = select_best_child(cur_node, cur_state->LegalActions());
-                cur_state->ApplyAction(best.first);
-                
-                cur_node = best.second;
-                if (!cur_state->IsTerminal()) {
-                    cur_node->player_id = cur_state->CurrentPlayer();
+
+                if (cur_node->node_type == NodeType::CHANCE) {
+                    auto [action, child] = sample_chance_child(cur_node);
+                    cur_state->ApplyAction(action);
+                    cur_node = child;
+                    while (cur_state->IsChanceNode() && !cur_state->IsTerminal()) {
+                        auto sub_outcomes = cur_state->ChanceOutcomes();
+                        float r2 = dist(rng); float cum2 = 0.0f;
+                        open_spiel::Action sa2 = sub_outcomes[0].first;
+                        for (auto& so : sub_outcomes) { cum2 += so.second; if (r2 <= cum2) { sa2 = so.first; break; } }
+                        cur_state->ApplyAction(sa2);
+                    }
                 } else {
-                    cur_node->player_id = current_p;
-                }
-            }
-            // Evaluation & Expansion
-            float value = 0.0f;
+                    if (!chance_aware) advance_chance_nodes(cur_state.get(), nullptr);
+                    if (cur_state->IsTerminal()) break;
 
-            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
-            if (chance_aware && cur_state->IsChanceNode()) {
-                // [Optimized] Batch-evaluate all dice outcomes simultaneously.
-                auto outcomes = cur_state->ChanceOutcomes();
+                    open_spiel::Player current_p = cur_state->CurrentPlayer();
+                    auto best = select_best_child(cur_node, cur_state->LegalActions());
+                    cur_state->ApplyAction(best.first);
+                    cur_node = best.second;
 
-                struct OutcomeState {
-                    float prob;
-                    std::unique_ptr<open_spiel::State> state;
-                    bool is_terminal;
-                    open_spiel::Player pid;
-                };
-                std::vector<OutcomeState> outcome_states;
-                outcome_states.reserve(outcomes.size());
-
-                std::vector<std::vector<float>> batch_obs;
-                std::vector<int> live_indices;
-
-                for (const auto& outcome : outcomes) {
-                    auto clone_state = cur_state->Clone();
-                    clone_state->ApplyAction(outcome.first);
-                    advance_chance_nodes(clone_state.get(), nullptr);
-                    bool terminal = clone_state->IsTerminal();
-                    open_spiel::Player pid = cur_node->player_id < 0
-                        ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
-                        : cur_node->player_id;
-                    if (!terminal) {
-                        batch_obs.push_back(clone_state->ObservationTensor());
-                        live_indices.push_back((int)outcome_states.size());
-                    }
-                    outcome_states.push_back({static_cast<float>(outcome.second), std::move(clone_state), terminal, pid});
-                }
-
-                std::vector<EvaluatorResult> batch_results;
-                if (!batch_obs.empty()) {
-                    batch_results = evaluator->evaluate_batch(batch_obs);
-                }
-
-                float expected_value = 0.0f;
-                std::vector<float> expected_policy;
-                int policy_size = 0;
-                if (!batch_results.empty()) {
-                    policy_size = (int)batch_results[0].policy.size();
-                    expected_policy.resize(policy_size, 0.0f);
-                }
-
-                int live_idx = 0;
-                for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                    auto& os = outcome_states[oi];
-                    if (os.is_terminal) {
-                        expected_value += os.prob * os.state->PlayerReturn(os.pid);
+                    if (!cur_state->IsTerminal()) {
+                        if (chance_aware && cur_state->IsChanceNode()) {
+                            cur_node->node_type = NodeType::CHANCE;
+                            cur_node->player_id = current_p;
+                        } else {
+                            cur_node->node_type = NodeType::PLAYER;
+                            cur_node->player_id = cur_state->CurrentPlayer();
+                        }
                     } else {
-                        float v = batch_results[live_idx].value;
-                        if (os.state->CurrentPlayer() != cur_node->player_id) v = -v;
-                        expected_value += os.prob * v;
-                        const auto& pol = batch_results[live_idx].policy;
-                        for (int a = 0; a < policy_size; ++a) {
-                            expected_policy[a] += os.prob * pol[a];
-                        }
-                        live_idx++;
+                        cur_node->player_id = current_p;
                     }
                 }
-                value = expected_value;
+                if (cur_state->IsTerminal()) break;
+            }
 
-                if (!cur_node->is_expanded && !expected_policy.empty()) {
-                    for (int oi = 0; oi < (int)outcome_states.size(); ++oi) {
-                        if (!outcome_states[oi].is_terminal) {
-                            cur_node->player_id = outcome_states[oi].state->CurrentPlayer();
-                            expand_node(cur_node, *outcome_states[oi].state, expected_policy);
-                            break;
-                        }
-                    }
-                }
+            float value = 0.0f;
+            if (cur_state->IsTerminal()) {
+                if (cur_node->player_id < 0)
+                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                value = cur_state->PlayerReturn(cur_node->player_id);
+            } else if (chance_aware && (cur_state->IsChanceNode() || cur_node->node_type == NodeType::CHANCE)) {
+                cur_node->node_type = NodeType::CHANCE;
+                cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                value = expand_chance_node(cur_node, *cur_state);
             } else {
-                // [Baseline] Original blind single-sample logic (clone branch)
-                advance_chance_nodes(cur_state.get(), nullptr);
+                if (!chance_aware) advance_chance_nodes(cur_state.get(), nullptr);
                 if (cur_state->IsTerminal()) {
-                    if (cur_node->player_id < 0) {
+                    if (cur_node->player_id < 0)
                         cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
-                    }
                     value = cur_state->PlayerReturn(cur_node->player_id);
                 } else {
                     std::vector<float> obs_vec = cur_state->ObservationTensor();

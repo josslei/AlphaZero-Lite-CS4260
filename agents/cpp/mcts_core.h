@@ -90,6 +90,9 @@ private:
     std::shared_ptr<PerfMetrics> metrics;
 };
 
+// [Fix 1] Node type: PLAYER nodes use PUCT selection; CHANCE nodes use probability sampling.
+enum class NodeType { PLAYER, CHANCE };
+
 struct Node
 {
     Node *parent;
@@ -97,12 +100,17 @@ struct Node
     bool is_expanded = false;
     open_spiel::Player player_id = 0;
 
+    // [Fix 1] Indicates whether this node represents a player decision or a stochastic
+    // chance event. Determines which selection rule is applied during tree traversal.
+    NodeType node_type = NodeType::PLAYER;
+
     int visit_count = 0;
     float total_value = 0.0f;
     float mean_value = 0.0f;
     float prior_prob = 1.0f;
 
-    Node(Node *p = nullptr, float prior = 1.0f) : parent(p), prior_prob(prior) {}
+    Node(Node *p = nullptr, float prior = 1.0f, NodeType nt = NodeType::PLAYER)
+        : parent(p), prior_prob(prior), node_type(nt) {}
 };
 
 struct StepRecord {
@@ -124,7 +132,13 @@ private:
     void play_game(const std::string& game_name, std::vector<std::vector<std::tuple<std::vector<float>, std::vector<float>, float>>>& all_trajectories, std::mutex& traj_mutex);
     void run_mcts(Node *root, open_spiel::State& current_state);
     std::pair<open_spiel::Action, Node *> select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions);
+    // [Fix 4] Sample a child of a chance node by its prior (outcome probability).
+    std::pair<open_spiel::Action, Node *> sample_chance_child(Node *node);
     void expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy);
+    // [Fix 1/3B] Expand a chance node: create one child per outcome (keyed by dice action),
+    // each child is a PLAYER node already expanded with its own NN policy.
+    // Returns the probability-weighted expected value across all outcomes.
+    float expand_chance_node(Node *node, open_spiel::State& state);
     void backpropagate(Node *node, float value);
     void advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path = nullptr);
 
@@ -164,7 +178,13 @@ private:
     
     void run_mcts(Node *root, open_spiel::State& current_state);
     std::pair<open_spiel::Action, Node *> select_best_child(Node *node, const std::vector<open_spiel::Action>& legal_actions);
+    // [Fix 4] Sample a child of a chance node by its prior (outcome probability).
+    std::pair<open_spiel::Action, Node *> sample_chance_child(Node *node);
     void expand_node(Node *node, const open_spiel::State& state, const std::vector<float> &policy);
+    // [Fix 1/3B] Expand a chance node: create one child per outcome (keyed by dice action),
+    // each child is a PLAYER node already expanded with its own NN policy.
+    // Returns the probability-weighted expected value across all outcomes.
+    float expand_chance_node(Node *node, open_spiel::State& state);
     void backpropagate(Node *node, float value);
     void advance_chance_nodes(open_spiel::State* state, std::vector<std::pair<open_spiel::Player, open_spiel::Action>>* action_path = nullptr);
 
