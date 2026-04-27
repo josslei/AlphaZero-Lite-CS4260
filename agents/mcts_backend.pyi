@@ -14,6 +14,7 @@ class SelfPlayEngine:
         dirichlet_epsilon: float = 0.25,
         use_fp16: bool = False,
         use_undo: bool = False,
+        chance_aware: bool = False,
     ) -> None: ...
     def generate_games(
         self, num_games: int, game_name: str = "connect_four"
@@ -32,6 +33,8 @@ class TournamentEngine:
         c_puct: float = 1.0,
         use_fp16: bool = False,
         use_undo: bool = False,
+        opening_temp_moves: int = 0,
+        chance_aware: bool = False,
     ) -> None: ...
     def play_tournament(
         self, num_games: int, game_name: str = "connect_four", opponent: str = "greedy"

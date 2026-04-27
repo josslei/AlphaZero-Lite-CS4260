@@ -201,8 +201,8 @@ void BatchEvaluator::run_inference()
 }
 
 // ---------- SelfPlayEngine ----------
-SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon, bool use_fp16, bool use_undo)
-    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), dirichlet_alpha(dirichlet_alpha), dirichlet_epsilon(dirichlet_epsilon), use_undo(use_undo)
+SelfPlayEngine::SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon, bool use_fp16, bool use_undo, bool chance_aware)
+    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), dirichlet_alpha(dirichlet_alpha), dirichlet_epsilon(dirichlet_epsilon), use_undo(use_undo), chance_aware(chance_aware)
 {
     metrics = std::make_shared<PerfMetrics>();
     evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, obs_flat_size, metrics, use_fp16);
@@ -360,24 +360,52 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                     cur_node->player_id = current_p; // Maintain alignment for terminal
                 }
             }
-            advance_chance_nodes(sim_state.get(), &action_path);
-
             // Evaluation & Expansion
             float value = 0.0f;
-            if (sim_state->IsTerminal())
-            {
-                if (cur_node->player_id < 0) {
-                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+
+            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
+            if (chance_aware && sim_state->IsChanceNode()) {
+                // [Experimental] Fully expand all dice outcomes and compute \E[v]
+                float expected_value = 0.0f;
+                auto outcomes = sim_state->ChanceOutcomes();
+                for (const auto& outcome : outcomes) {
+                    auto clone_state = sim_state->Clone();
+                    clone_state->ApplyAction(outcome.first);
+                    advance_chance_nodes(clone_state.get(), nullptr); // fast-forward nested chance
+                    if (clone_state->IsTerminal()) {
+                        open_spiel::Player pid = cur_node->player_id < 0
+                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                            : cur_node->player_id;
+                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    } else {
+                        std::vector<float> obs_vec = clone_state->ObservationTensor();
+                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                        float v = res.value;
+                        // Perspective alignment: flip if clone is now opponent's turn
+                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
+                            v = -v;
+                        }
+                        expected_value += outcome.second * v;
+                    }
                 }
-                value = sim_state->PlayerReturn(cur_node->player_id);
-            }
-            else
-            {
-                std::vector<float> obs_vec = sim_state->ObservationTensor();
-                EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                expand_node(cur_node, *sim_state, res.policy);
-                value = res.value;
-                cur_node->player_id = sim_state->CurrentPlayer();
+                value = expected_value;
+                // Skip expand_node: this chance node remains un-expanded so future
+                // iterations revisit it and recompute the expectation fresh.
+            } else {
+                // [Baseline] Original blind single-sample logic (use_undo branch)
+                advance_chance_nodes(sim_state.get(), &action_path);
+                if (sim_state->IsTerminal()) {
+                    if (cur_node->player_id < 0) {
+                        cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                    }
+                    value = sim_state->PlayerReturn(cur_node->player_id);
+                } else {
+                    std::vector<float> obs_vec = sim_state->ObservationTensor();
+                    EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                    expand_node(cur_node, *sim_state, res.policy);
+                    value = res.value;
+                    cur_node->player_id = sim_state->CurrentPlayer();
+                }
             }
 
             backpropagate(cur_node, value);
@@ -408,24 +436,49 @@ void SelfPlayEngine::run_mcts(Node *root, open_spiel::State& current_state)
                     cur_node->player_id = current_p;
                 }
             }
-            advance_chance_nodes(cur_state.get(), nullptr);
-
             // Evaluation & Expansion
             float value = 0.0f;
-            if (cur_state->IsTerminal())
-            {
-                if (cur_node->player_id < 0) {
-                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+
+            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
+            if (chance_aware && cur_state->IsChanceNode()) {
+                // [Experimental] Fully expand all dice outcomes and compute \E[v]
+                float expected_value = 0.0f;
+                auto outcomes = cur_state->ChanceOutcomes();
+                for (const auto& outcome : outcomes) {
+                    auto clone_state = cur_state->Clone();
+                    clone_state->ApplyAction(outcome.first);
+                    advance_chance_nodes(clone_state.get(), nullptr);
+                    if (clone_state->IsTerminal()) {
+                        open_spiel::Player pid = cur_node->player_id < 0
+                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                            : cur_node->player_id;
+                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    } else {
+                        std::vector<float> obs_vec = clone_state->ObservationTensor();
+                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                        float v = res.value;
+                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
+                            v = -v;
+                        }
+                        expected_value += outcome.second * v;
+                    }
                 }
-                value = cur_state->PlayerReturn(cur_node->player_id);
-            }
-            else
-            {
-                std::vector<float> obs_vec = cur_state->ObservationTensor();
-                EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                expand_node(cur_node, *cur_state, res.policy);
-                value = res.value;
-                cur_node->player_id = cur_state->CurrentPlayer();
+                value = expected_value;
+            } else {
+                // [Baseline] Original blind single-sample logic (clone branch)
+                advance_chance_nodes(cur_state.get(), nullptr);
+                if (cur_state->IsTerminal()) {
+                    if (cur_node->player_id < 0) {
+                        cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                    }
+                    value = cur_state->PlayerReturn(cur_node->player_id);
+                } else {
+                    std::vector<float> obs_vec = cur_state->ObservationTensor();
+                    EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                    expand_node(cur_node, *cur_state, res.policy);
+                    value = res.value;
+                    cur_node->player_id = cur_state->CurrentPlayer();
+                }
             }
 
             backpropagate(cur_node, value);
@@ -868,8 +921,8 @@ open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& 
     return best_action;
 }
 
-TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16, bool use_undo, int opening_temp_moves)
-    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), use_undo(use_undo), opening_temp_moves(opening_temp_moves)
+TournamentEngine::TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16, bool use_undo, int opening_temp_moves, bool chance_aware)
+    : obs_flat_size(obs_flat_size), num_threads(num_threads), num_iters(num_iters), temperature(temperature), c_puct(c_puct), use_undo(use_undo), opening_temp_moves(opening_temp_moves), chance_aware(chance_aware)
 {
     metrics = std::make_shared<PerfMetrics>();
     evaluator = std::make_shared<BatchEvaluator>(model_path, batch_size, obs_flat_size, metrics, use_fp16);
@@ -997,20 +1050,49 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                     cur_node->player_id = current_p;
                 }
             }
-            advance_chance_nodes(sim_state.get(), &action_path);
-
+            // Evaluation & Expansion
             float value = 0.0f;
-            if (sim_state->IsTerminal()) {
-                if (cur_node->player_id < 0) {
-                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+
+            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
+            if (chance_aware && sim_state->IsChanceNode()) {
+                // [Experimental] Fully expand all dice outcomes and compute \E[v]
+                float expected_value = 0.0f;
+                auto outcomes = sim_state->ChanceOutcomes();
+                for (const auto& outcome : outcomes) {
+                    auto clone_state = sim_state->Clone();
+                    clone_state->ApplyAction(outcome.first);
+                    advance_chance_nodes(clone_state.get(), nullptr);
+                    if (clone_state->IsTerminal()) {
+                        open_spiel::Player pid = cur_node->player_id < 0
+                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                            : cur_node->player_id;
+                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    } else {
+                        std::vector<float> obs_vec = clone_state->ObservationTensor();
+                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                        float v = res.value;
+                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
+                            v = -v;
+                        }
+                        expected_value += outcome.second * v;
+                    }
                 }
-                value = sim_state->PlayerReturn(cur_node->player_id);
+                value = expected_value;
             } else {
-                std::vector<float> obs_vec = sim_state->ObservationTensor();
-                EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                expand_node(cur_node, *sim_state, res.policy);
-                value = res.value;
-                cur_node->player_id = sim_state->CurrentPlayer();
+                // [Baseline] Original blind single-sample logic (use_undo branch)
+                advance_chance_nodes(sim_state.get(), &action_path);
+                if (sim_state->IsTerminal()) {
+                    if (cur_node->player_id < 0) {
+                        cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                    }
+                    value = sim_state->PlayerReturn(cur_node->player_id);
+                } else {
+                    std::vector<float> obs_vec = sim_state->ObservationTensor();
+                    EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                    expand_node(cur_node, *sim_state, res.policy);
+                    value = res.value;
+                    cur_node->player_id = sim_state->CurrentPlayer();
+                }
             }
 
             backpropagate(cur_node, value);
@@ -1036,20 +1118,49 @@ void TournamentEngine::run_mcts(Node *root, open_spiel::State& current_state)
                     cur_node->player_id = current_p;
                 }
             }
-            advance_chance_nodes(cur_state.get(), nullptr);
-
+            // Evaluation & Expansion
             float value = 0.0f;
-            if (cur_state->IsTerminal()) {
-                if (cur_node->player_id < 0) {
-                    cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+
+            // [Core Modification] Omniscient Expectation vs. Baseline single-sample
+            if (chance_aware && cur_state->IsChanceNode()) {
+                // [Experimental] Fully expand all dice outcomes and compute \E[v]
+                float expected_value = 0.0f;
+                auto outcomes = cur_state->ChanceOutcomes();
+                for (const auto& outcome : outcomes) {
+                    auto clone_state = cur_state->Clone();
+                    clone_state->ApplyAction(outcome.first);
+                    advance_chance_nodes(clone_state.get(), nullptr);
+                    if (clone_state->IsTerminal()) {
+                        open_spiel::Player pid = cur_node->player_id < 0
+                            ? (cur_node->parent != nullptr ? cur_node->parent->player_id : 0)
+                            : cur_node->player_id;
+                        expected_value += outcome.second * clone_state->PlayerReturn(pid);
+                    } else {
+                        std::vector<float> obs_vec = clone_state->ObservationTensor();
+                        EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                        float v = res.value;
+                        if (clone_state->CurrentPlayer() != cur_node->player_id) {
+                            v = -v;
+                        }
+                        expected_value += outcome.second * v;
+                    }
                 }
-                value = cur_state->PlayerReturn(cur_node->player_id);
+                value = expected_value;
             } else {
-                std::vector<float> obs_vec = cur_state->ObservationTensor();
-                EvaluatorResult res = evaluator->evaluate(obs_vec.data());
-                expand_node(cur_node, *cur_state, res.policy);
-                value = res.value;
-                cur_node->player_id = cur_state->CurrentPlayer();
+                // [Baseline] Original blind single-sample logic (clone branch)
+                advance_chance_nodes(cur_state.get(), nullptr);
+                if (cur_state->IsTerminal()) {
+                    if (cur_node->player_id < 0) {
+                        cur_node->player_id = cur_node->parent != nullptr ? cur_node->parent->player_id : 0;
+                    }
+                    value = cur_state->PlayerReturn(cur_node->player_id);
+                } else {
+                    std::vector<float> obs_vec = cur_state->ObservationTensor();
+                    EvaluatorResult res = evaluator->evaluate(obs_vec.data());
+                    expand_node(cur_node, *cur_state, res.policy);
+                    value = res.value;
+                    cur_node->player_id = cur_state->CurrentPlayer();
+                }
             }
 
             backpropagate(cur_node, value);

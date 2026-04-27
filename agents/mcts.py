@@ -216,6 +216,7 @@ class SelfPlayEngine:
         dirichlet_epsilon: float = 0.25,
         use_fp16: bool = False,
         use_undo: bool = False,
+        chance_aware: bool = False,  # [New] Omniscient Expectation ablation switch
     ):
         if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
@@ -234,6 +235,7 @@ class SelfPlayEngine:
             dirichlet_epsilon,
             use_fp16,
             use_undo,
+            chance_aware,
         )
 
     def generate_games(self, num_games: int, game_name: str = "connect_four"):
@@ -256,6 +258,7 @@ class TournamentEngine:
         use_fp16: bool = False,
         use_undo: bool = False,
         opening_temp_moves: int = 0,
+        chance_aware: bool = False,  # [New] Omniscient Expectation ablation switch
     ):
         if not USE_CPP or mcts_backend is None:
             raise RuntimeError("C++ MCTS backend is not available.")
@@ -273,6 +276,7 @@ class TournamentEngine:
             use_fp16,
             use_undo,
             opening_temp_moves,
+            chance_aware,
         )
 
     def play_tournament(self, num_games: int, game_name: str = "connect_four", opponent: str = "greedy"):

@@ -65,6 +65,7 @@ def execute_self_play(
         dirichlet_epsilon=mcts_cfg.get("dirichlet_epsilon", 0.25),
         use_fp16=use_fp16,
         use_undo=use_undo,
+        chance_aware=mcts_cfg.get("chance_aware", False),  # [New] Ablation switch
     )
 
     trajectories = engine.generate_games(num_games=num_games, game_name=game_name)
@@ -379,6 +380,7 @@ class LightTournamentCallback(Callback):
             c_puct=c_puct,
             use_fp16=use_fp16,
             opening_temp_moves=self.config.get("evaluation", {}).get("opening_temp_moves", 2),
+            chance_aware=mcts_cfg.get("chance_aware", False),  # [New] Ablation switch
         )
 
         for opponent_cfg in self.opponents_cfg:

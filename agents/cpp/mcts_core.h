@@ -108,7 +108,7 @@ struct StepRecord {
 class SelfPlayEngine
 {
 public:
-    SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon, bool use_fp16 = false, bool use_undo = false);
+    SelfPlayEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, float dirichlet_alpha, float dirichlet_epsilon, bool use_fp16 = false, bool use_undo = false, bool chance_aware = false);
     ~SelfPlayEngine();
 
     py::list generate_games(int num_games, const std::string& game_name);
@@ -132,6 +132,7 @@ private:
     float dirichlet_alpha;
     float dirichlet_epsilon;
     bool use_undo;
+    bool chance_aware;
 };
 
 // --- Tournament Engine and Greedy/Minimax ---
@@ -146,7 +147,7 @@ public:
     // opening_temp_moves: number of game plies at the start of each match where the model
     // samples from a temperature=1 distribution instead of greedy argmax. This diversifies
     // openings so that repeated games under temperature=0 are not identical.
-    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false, bool use_undo = false, int opening_temp_moves = 0);
+    TournamentEngine(const std::string& model_path, int batch_size, int obs_flat_size, int num_threads, int num_iters, float temperature, float c_puct, bool use_fp16 = false, bool use_undo = false, int opening_temp_moves = 0, bool chance_aware = false);
     ~TournamentEngine();
 
     // Returns a dictionary with wins, losses, draws
@@ -170,4 +171,5 @@ private:
     float c_puct;
     bool use_undo;
     int opening_temp_moves; // plies with temperature=1 to diversify openings
+    bool chance_aware;
 };

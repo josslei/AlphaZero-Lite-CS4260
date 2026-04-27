@@ -1,4 +1,4 @@
-# Experiment: Backgammon Base
+# Experiment: Backgammon Adapted (Chance-Aware MCTS)
 game:
   name: "backgammon"
   params: {}
@@ -17,8 +17,8 @@ mcts:
 
   # [Ablation] Omniscient Expectation MCTS: fully expand chance nodes at leaf nodes
   # and compute the exact mathematical expectation instead of blind single-sampling.
-  # This is the baseline version (control group).
-  chance_aware: false
+  # This version has the adaptation enabled.
+  chance_aware: true
 
   # Dirichlet Noise tailored for backgammon branching factor
   dirichlet_alpha: 0.15

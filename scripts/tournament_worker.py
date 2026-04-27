@@ -73,6 +73,7 @@ def run_worker(model_path: str, config: dict, log_dir: str, epoch: int, device: 
         use_fp16=use_fp16,
         use_undo=use_undo,
         opening_temp_moves=opening_temp_moves,
+        chance_aware=mcts_cfg.get("chance_aware", False),  # [New] Ablation switch
     )
 
     all_results: dict = {}
