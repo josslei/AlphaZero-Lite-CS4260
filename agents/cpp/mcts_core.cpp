@@ -642,17 +642,160 @@ py::dict SelfPlayEngine::get_metrics() {
     return d;
 }
 
-// ---------- TournamentEngine and Greedy ----------
+// Connect Four board constants (open_spiel ObservationTensor layout: 3 planes x 6 rows x 7 cols)
+// Plane 0: current player pieces, Plane 1: other player pieces, Plane 2: empty
+static constexpr int CF_ROWS = 6;
+static constexpr int CF_COLS = 7;
+static constexpr int CF_PLANES = 3;
+
+// Extract a cell from the flat observation tensor.
+// Returns +1 if 'player' occupies [r][c], -1 if opponent, 0 if empty.
+static inline int CF_Cell(const std::vector<float>& obs, int plane, int row, int col) {
+    int idx = plane * CF_ROWS * CF_COLS + row * CF_COLS + col;
+    return (obs[idx] > 0.5f) ? 1 : 0;
+}
+
+// Score a window of 4 cells for a given player (returns heuristic contribution).
+static int CF_ScoreWindow(int p_count, int opp_count, int empty_count) {
+    if (p_count == 4)                          return 1000;
+    if (p_count == 3 && empty_count == 1)      return 10;
+    if (p_count == 2 && empty_count == 2)      return 2;
+    if (opp_count == 3 && empty_count == 1)    return -80;
+    return 0;
+}// Full Connect Four board heuristic from an observation tensor.
+// player=0 means the perspective of the current player (plane 0).
+static float EvaluateConnectFour(const std::vector<float>& obs) {
+    // Build a 2D board function: +1 = current player, -1 = opponent, 0 = empty
+    auto cell = [&](int r, int c) -> int {
+        if (CF_Cell(obs, 0, r, c)) return +1;
+        if (CF_Cell(obs, 1, r, c)) return -1;
+        return 0;
+    };
+
+    float score = 0.0f;
+
+    // Centre column preference
+    int centre_col = CF_COLS / 2;
+    for (int r = 0; r < CF_ROWS; ++r)
+        if (cell(r, centre_col) == +1) score += 3.0f;
+
+    // score_window: returns the window's heuristic value (no mutation of outer scope)
+    auto score_window = [&](int r0, int c0, int dr, int dc) -> int {
+        int p_cnt = 0, opp_cnt = 0, emp_cnt = 0;
+        for (int k = 0; k < 4; ++k) {
+            int v = cell(r0 + k*dr, c0 + k*dc);
+            if (v == +1) p_cnt++;
+            else if (v == -1) opp_cnt++;
+            else emp_cnt++;
+        }
+        return CF_ScoreWindow(p_cnt, opp_cnt, emp_cnt);
+    };
+
+    // Horizontal
+    for (int r = 0; r < CF_ROWS; ++r)
+        for (int c = 0; c <= CF_COLS - 4; ++c)
+            score += score_window(r, c, 0, 1);
+    // Vertical
+    for (int r = 0; r <= CF_ROWS - 4; ++r)
+        for (int c = 0; c < CF_COLS; ++c)
+            score += score_window(r, c, 1, 0);
+    // Diagonal /
+    for (int r = 3; r < CF_ROWS; ++r)
+        for (int c = 0; c <= CF_COLS - 4; ++c)
+            score += score_window(r, c, -1, 1);
+    // Diagonal backslash
+    for (int r = 0; r <= CF_ROWS - 4; ++r)
+        for (int c = 0; c <= CF_COLS - 4; ++c)
+            score += score_window(r, c, 1, 1);
+
+    return score;
+}
+
+// Minimax with alpha-beta pruning. Only implemented for connect_four.
+// val is from the perspective of the *root* player (maximising player).
+static float AlphaBeta(
+    const open_spiel::State& state,
+    int depth, float alpha, float beta,
+    bool maximising,
+    open_spiel::Player root_player)
+{
+    if (state.IsTerminal()) {
+        float ret = state.PlayerReturn(root_player);
+        // Scale terminal returns to large values so they dominate heuristic scores
+        return ret * 1e6f;
+    }
+    if (depth == 0) {
+        // Leaf evaluation: get the observation tensor for the current player
+        std::vector<float> obs = state.ObservationTensor(root_player);
+        // If it's not the root player's turn, flip perspective
+        float h = EvaluateConnectFour(obs);
+        return maximising ? h : -h;
+    }
+
+    std::vector<open_spiel::Action> actions = state.LegalActions();
+    if (actions.empty()) return 0.0f;
+
+    if (maximising) {
+        float val = -1e9f;
+        for (auto a : actions) {
+            auto child = state.Clone();
+            child->ApplyAction(a);
+            val = std::max(val, AlphaBeta(*child, depth - 1, alpha, beta, false, root_player));
+            alpha = std::max(alpha, val);
+            if (alpha >= beta) break; // beta cut-off
+        }
+        return val;
+    } else {
+        float val = 1e9f;
+        for (auto a : actions) {
+            auto child = state.Clone();
+            child->ApplyAction(a);
+            val = std::min(val, AlphaBeta(*child, depth - 1, alpha, beta, true, root_player));
+            beta = std::min(beta, val);
+            if (beta <= alpha) break; // alpha cut-off
+        }
+        return val;
+    }
+}
+
+open_spiel::Action GetMinimaxAction(open_spiel::State& state, const std::string& game_name, int depth) {
+    // Minimax is only implemented for Connect Four
+    if (game_name != "connect_four") {
+        // Fallback to greedy for other games
+        return GetGreedyAction(state, game_name);
+    }
+
+    std::vector<open_spiel::Action> actions = state.LegalActions();
+    if (actions.empty()) return open_spiel::kInvalidAction;
+
+    open_spiel::Player root_player = state.CurrentPlayer();
+    open_spiel::Action best_action = actions[0];
+    float best_val = -1e9f;
+
+    for (auto a : actions) {
+        auto child = state.Clone();
+        child->ApplyAction(a);
+        // After applying our move we are in the minimising position for the opponent
+        float val = AlphaBeta(*child, depth - 1, -1e9f, 1e9f, false, root_player);
+        if (val > best_val) {
+            best_val = val;
+            best_action = a;
+        }
+    }
+    return best_action;
+}
+
 float EvaluateStateGreedy(const open_spiel::State& state, const std::string& game_name, open_spiel::Player player) {
     if (state.IsTerminal()) {
         return state.PlayerReturn(player);
     }
     
-    // Abstracted heuristic function placeholder
     if (game_name == "connect_four") {
-        return 0.0f; // Connect four heuristic
+        // Use the real Connect Four heuristic from the perspective of `player`
+        std::vector<float> obs = state.ObservationTensor(player);
+        return EvaluateConnectFour(obs);
     } else if (game_name == "backgammon") {
-        return 0.0f; // Backgammon heuristic
+        return 0.0f; // Backgammon heuristic stub
     }
     return 0.0f;
 }
@@ -888,11 +1031,20 @@ void TournamentEngine::play_match(const std::string& game_name, const std::strin
             }
             if (best_action == -1 && !legal_actions.empty()) best_action = legal_actions[0];
         } else {
-            // Opponent Turn (Greedy)
+            // Opponent Turn
             if (opponent == "greedy") {
                 best_action = GetGreedyAction(*state, game_name);
+            } else if (opponent == "minimax") {
+                // Default depth=4 for minimax; fast enough with alpha-beta on Connect Four
+                best_action = GetMinimaxAction(*state, game_name, /*depth=*/4);
+            } else if (opponent == "random") {
+                std::vector<open_spiel::Action> legal_actions = state->LegalActions();
+                if (!legal_actions.empty()) {
+                    std::uniform_int_distribution<int> distrib(0, legal_actions.size() - 1);
+                    best_action = legal_actions[distrib(rng)];
+                }
             } else {
-                // Random fallback
+                // Unknown opponent: random fallback
                 std::vector<open_spiel::Action> legal_actions = state->LegalActions();
                 if (!legal_actions.empty()) {
                     std::uniform_int_distribution<int> distrib(0, legal_actions.size() - 1);

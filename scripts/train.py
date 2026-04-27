@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 import datetime
 import torch
 import numpy as np
@@ -295,7 +296,7 @@ class SelfPlayCallback(Callback):
         print(f"<<< [Epoch {trainer.current_epoch}] Neural Network Training: END\n")
 
 
-class TournamentCallback(Callback):
+class LightTournamentCallback(Callback):
     """
     Evaluates the current model's performance against benchmark opponents (Random, Minimax, etc.) configured in the YAML.
     """
@@ -430,6 +431,114 @@ class TournamentCallback(Callback):
             torch.cuda.empty_cache()
 
 
+class FullTournamentCallback(Callback):
+    """
+    Runs a full, comprehensive tournament every N epochs against all configured
+    opponents (Random, Greedy, Minimax). Executes as a non-blocking background
+    subprocess so it never stalls the main training loop.
+
+    Results are written to the same TensorBoard log directory under the
+    'full_eval/' prefix and to a JSON file per epoch.
+    """
+
+    def __init__(self, config, output_dir: str, obs_flat_size: int, tb_log_dir: str):
+        super().__init__()
+        self.config = config
+        self.output_dir = output_dir
+        self.obs_flat_size = obs_flat_size
+        self.tb_log_dir = tb_log_dir
+
+        full_cfg = config.get("full_tournament", {})
+        self.enabled = full_cfg.get("enabled", False)
+        self.interval = full_cfg.get("interval", 10)
+        # cpu / cuda — configurable so user can reserve GPU for training if desired
+        self.device = full_cfg.get("device", "cuda")
+
+        # Path to the worker script (same directory as this file)
+        self._worker_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tournament_worker.py"
+        )
+
+        # Track active background process to avoid stacking multiple runs
+        self._bg_process: subprocess.Popen | None = None
+        self._config_path: str | None = None
+
+    def _get_config_path(self, trainer: pl.Trainer) -> str:
+        """Return the dumped config path written during main() setup."""
+        return os.path.join(self.output_dir, "config_dump.yaml")
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        if not self.enabled:
+            return
+        if (trainer.current_epoch + 1) % self.interval != 0:
+            return
+
+        # Check if a previous tournament is still running; don't stack
+        if self._bg_process is not None and self._bg_process.poll() is None:
+            print(
+                f"[FullTournament] Skipping epoch {trainer.current_epoch}: "
+                "previous full tournament is still running in background."
+            )
+            return
+
+        # Export current weights as a snapshot for the worker to use
+        export_path = os.path.join(self.output_dir, "full_eval_model.pt")
+        use_fp16 = self.config["system"].get("use_fp16", False)
+
+        export_params = self.config["model"]["params"].copy()
+        export_params["return_logits"] = False
+        snap_model = get_model(self.config["model"]["architecture"], export_params)
+        snap_model.load_state_dict(pl_module.model.state_dict())
+        snap_model.to(pl_module.device)
+        snap_model.eval()
+        if use_fp16:
+            snap_model.half()
+
+        input_dtype = torch.float16 if use_fp16 else torch.float32
+        example_input = torch.randn(
+            1, self.obs_flat_size, device=pl_module.device, dtype=input_dtype
+        )
+        traced = cast(torch.jit.ScriptModule, torch.jit.trace(snap_model, example_input))
+        traced = torch.jit.optimize_for_inference(traced)
+        traced.save(export_path)
+        del snap_model
+
+        # Spawn the worker as an independent OS process — completely non-blocking
+        cmd = [
+            sys.executable,
+            self._worker_script,
+            "--model_path", export_path,
+            "--config",     self._get_config_path(trainer),
+            "--log_dir",    self.tb_log_dir,
+            "--epoch",      str(trainer.current_epoch),
+            "--device",     self.device,
+        ]
+
+        print(
+            f"\n>>> [Epoch {trainer.current_epoch}] FullTournament: "
+            f"Launching background process (device={self.device}) ..."
+        )
+        # start_new_session=True detaches from the parent process group so it
+        # survives even if the parent receives a SIGINT during evaluation.
+        self._bg_process = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        print(
+            f"    [FullTournament] Worker PID: {self._bg_process.pid} — training continues immediately."
+        )
+
+    def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        """Wait for any still-running background tournament to finish cleanly."""
+        if self._bg_process is not None and self._bg_process.poll() is None:
+            print("[FullTournament] Training finished. Waiting for background tournament to complete...")
+            stdout, _ = self._bg_process.communicate()
+            if stdout:
+                print(stdout.decode(errors="replace"))
+            print("[FullTournament] Background tournament complete.")
+
 def main():
     parser = argparse.ArgumentParser(description="AlphaZero General Training Script")
     parser.add_argument("--config", type=str, required=True, help="Path to the YAML config file")
@@ -536,7 +645,13 @@ def main():
         precision=precision,
         callbacks=[
             SelfPlayCallback(config=config, output_dir=run_dir, obs_flat_size=obs_flat_size),
-            TournamentCallback(config=config, obs_flat_size=obs_flat_size),
+            LightTournamentCallback(config=config, obs_flat_size=obs_flat_size),
+            FullTournamentCallback(
+                config=config,
+                output_dir=run_dir,
+                obs_flat_size=obs_flat_size,
+                tb_log_dir=os.path.join(run_dir, "tensorboard"),
+            ),
             ModelExportCallback(config=config, obs_flat_size=obs_flat_size),
             LearningRateMonitor(logging_interval="step"),
             checkpoint_callback,

@@ -70,3 +70,15 @@ evaluation:
     # - type: "minimax"
     #   depth: 3
 
+full_tournament:
+  enabled: false            # Set to true to activate
+  interval: 10              # Run every N epochs
+  num_games: 100            # Games per opponent (higher = more statistical confidence)
+  num_threads: 16           # Worker threads (auto-capped to num_games)
+  mcts_iters: 200           # MCTS iterations per AZ move (can be higher than light tournament)
+  device: "cuda"            # "cuda" or "cpu" — cuda is much faster but shares GPU with training
+  opponents:
+    - "random"
+    - "greedy"
+    - "minimax"             # Alpha-beta pruning, Connect Four only
+

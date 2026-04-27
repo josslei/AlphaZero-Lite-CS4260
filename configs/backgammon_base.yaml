@@ -69,3 +69,14 @@ evaluation:
     # - type: "minimax"
     #   depth: 3
 
+full_tournament:
+  enabled: false            # Set to true to activate
+  interval: 10              # Run every N epochs
+  num_games: 100            # Games per opponent
+  num_threads: 16           # Worker threads (auto-capped to num_games)
+  mcts_iters: 100           # Lower iters for backgammon (larger branching factor)
+  device: "cuda"            # "cuda" or "cpu"
+  opponents:
+    - "random"
+    - "greedy"              # Backgammon-specific heuristic (stub — implement when ready)
+

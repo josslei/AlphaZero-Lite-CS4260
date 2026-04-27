@@ -134,9 +134,11 @@ private:
     bool use_undo;
 };
 
-// --- Tournament Engine and Greedy ---
+// --- Tournament Engine and Greedy/Minimax ---
 float EvaluateStateGreedy(const open_spiel::State& state, const std::string& game_name, open_spiel::Player player);
 open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& game_name);
+// Minimax with alpha-beta pruning (Connect Four only; falls back to greedy for other games)
+open_spiel::Action GetMinimaxAction(open_spiel::State& state, const std::string& game_name, int depth = 4);
 
 class TournamentEngine
 {
