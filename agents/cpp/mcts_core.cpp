@@ -805,7 +805,22 @@ float EvaluateStateGreedy(const open_spiel::State& state, const std::string& gam
         std::vector<float> obs = state.ObservationTensor(player);
         return EvaluateConnectFour(obs);
     } else if (game_name == "backgammon") {
-        return 0.0f; // Backgammon heuristic stub
+        std::vector<float> obs = state.ObservationTensor(player);
+        
+        // OpenSpiel Backgammon observation tensor feature indices:
+        // 192: Number of checkers for Player 0 on the Bar
+        // 193: Number of checkers for Player 0 borne off (normalised: count / 15)
+        // 195: Number of checkers for Player 1 on the Bar
+        // 196: Number of checkers for Player 1 borne off (normalised: count / 15)
+        
+        float p0_score = obs[193] * 10.0f - obs[192] * 2.0f;
+        float p1_score = obs[196] * 10.0f - obs[195] * 2.0f;
+        
+        if (player == 0) {
+            return p0_score - p1_score;
+        } else {
+            return p1_score - p0_score;
+        }
     }
     return 0.0f;
 }
@@ -813,7 +828,18 @@ float EvaluateStateGreedy(const open_spiel::State& state, const std::string& gam
 open_spiel::Action GetGreedyAction(open_spiel::State& state, const std::string& game_name) {
     std::vector<open_spiel::Action> legal_actions = state.LegalActions();
     if (legal_actions.empty()) return open_spiel::kInvalidAction;
-    
+
+    // Backgammon can generate up to ~1352 legal action combinations per turn (each
+    // "action" encodes a full multi-pip move sequence for both dice). Cloning state
+    // for every candidate is the dominant tournament cost. We cap evaluation to a
+    // random sample so per-move work is O(kMaxGreedyEvals) regardless of branching.
+    constexpr int kMaxGreedyEvals = 30;
+    if ((int)legal_actions.size() > kMaxGreedyEvals) {
+        // Shuffle in-place using the thread-local RNG, then truncate.
+        std::shuffle(legal_actions.begin(), legal_actions.end(), rng);
+        legal_actions.resize(kMaxGreedyEvals);
+    }
+
     open_spiel::Player player = state.CurrentPlayer();
     open_spiel::Action best_action = legal_actions[0];
     float best_val = -1e9f;

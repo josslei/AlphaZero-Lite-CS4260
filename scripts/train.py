@@ -23,7 +23,6 @@ from agents.alphazero import AlphaZeroLightning
 from agents.replay_buffer import ReplayBuffer
 from agents.mcts import SelfPlayEngine
 from agents.game_spec import get_game_spec
-from agents.evaluation import create_agent
 
 
 def execute_self_play(

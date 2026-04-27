@@ -58,26 +58,28 @@ evaluation:
   interval: 1
   num_games: 10  # configurable
   num_threads: 10  # capped to num_games automatically; no point exceeding it
+  # opening_temp_moves: number of game plies for opening diversity
+  opening_temp_moves: 2
   alphazero:
     type: "alphazero"
     engine: "cpp"
     mcts_iters: 100
   opponents:
     - type: "greedy"
-    # Full tournament opponents (use a separate FullTournamentCallback later):
+    # Full tournament opponents:
     # - type: "random"
-    # - type: "minimax"
-    #   depth: 3
 
 full_tournament:
-  enabled: false            # Set to true to activate
+  enabled: true             # Set to true to activate
   interval: 10              # Run every N epochs
   num_games: 100            # Games per opponent
   num_threads: 16           # Worker threads (auto-capped to num_games)
   mcts_iters: 100           # Lower iters for backgammon (larger branching factor)
   device: "cuda"            # "cuda" or "cpu"
   use_undo: true            # Crucial for performance in Backgammon
+  # opening_temp_moves: number of game plies where the model samples with temperature=1
+  # instead of greedy argmax. Diversifies openings so repeated games are not identical.
+  opening_temp_moves: 2
   opponents:
     - "random"
-    - "greedy"              # Backgammon-specific heuristic (stub — implement when ready)
-
+    - "greedy"              # Backgammon-specific heuristic using Bar/Bear-off counts
